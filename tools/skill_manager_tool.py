@@ -293,6 +293,36 @@ def _find_skill(name: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def _locked_guard(name: str) -> Optional[str]:
+    """Refusal message if *name* is locked, else None. Lock is the edit-side counterpart to
+    ``_pinned_guard`` (which guards delete only): ``metadata.hermes.locked: true`` in SKILL.md
+    blocks edit, patch, delete, write_file and remove_file — for skills that gate real-world
+    side effects (financial transfers, device control, message dispatch) where silent drift via
+    the background self-improvement loop is unacceptable. Best-effort like ``_pinned_guard``: a
+    missing or unparseable SKILL.md lets the write through."""
+    try:
+        existing = _find_skill(name)
+        if not existing:
+            return None
+        skill_md = existing["path"] / "SKILL.md"
+        if not skill_md.exists():
+            return None
+        from agent.skill_utils import parse_frontmatter
+        fm, _body = parse_frontmatter(skill_md.read_text(encoding="utf-8"))
+        hermes_meta = (fm.get("metadata") or {}).get("hermes") or {}
+        if hermes_meta.get("locked") is True:
+            return (
+                f"Skill '{name}' is locked (metadata.hermes.locked: true) "
+                f"and cannot be modified by skill_manage. The lock prevents "
+                f"silent drift in skills that gate real-world side effects. "
+                f"To change it, ask the user to edit SKILL.md directly, or "
+                f"to set `metadata.hermes.locked: false` in its frontmatter "
+                f"first.")
+    except Exception:
+        logger.debug("locked-guard lookup failed for %s", name, exc_info=True)
+    return None
+
+
 def _find_skill_in_other_profiles(name: str) -> list[tuple[str, Path]]:
     """``(profile, skill_dir)`` pairs for OTHER profiles holding ``name`` (so the not-found
     error can explain a wrong-profile mistake). Fail-quiet."""
@@ -777,6 +807,11 @@ def skill_manage(
             operations, default_name=name or None, task_id=task_id, session_id=session_id)
     if (preflight := _background_review_preflight(action, name)) is not None:
         return json.dumps(preflight, ensure_ascii=False)
+    # Lock refuses before the approval gate, so a locked skill never lands in the pending queue.
+    # Batch ops re-enter here one by one via _skill_manage_from, so both shapes are covered.
+    if action in ("edit", "patch", "delete", "write_file", "remove_file"):
+        if (locked_err := _locked_guard(name)) is not None:
+            return tool_error(locked_err, success=False)
     # Approval gate: skills are too large to review inline, so they always stage regardless
     # of origin; bypassed when replaying an approved staged write.
     args = dict(content=content, category=category, file_path=file_path, file_content=file_content,
