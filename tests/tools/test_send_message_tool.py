@@ -27,6 +27,7 @@ def _reset_signal_scheduler():
 
 from gateway.config import Platform
 from tools.send_message_tool import (
+    _edit_telegram,
     _resolve_slack_user_target,
     _send_matrix_via_adapter,
     _send_signal,
@@ -1616,6 +1617,194 @@ class TestSendTelegramThreadNotFoundRetry:
         finally:
             if media_path and os.path.exists(media_path):
                 os.unlink(media_path)
+
+
+class TestEditTelegram:
+    """In-place edit of a Telegram message via _edit_telegram (hermes#62).
+
+    Mirrors TestSendTelegramHtmlDetection: HTML auto-detect, MarkdownV2 for
+    plain/markdown, not-modified treated as success, parse-failure fallback
+    to plain text.
+    """
+
+    def _make_bot(self):
+        bot = MagicMock()
+        bot.edit_message_text = AsyncMock(return_value=SimpleNamespace(message_id=99))
+        return bot
+
+    def test_edit_calls_edit_message_text_with_chat_and_message_id(self, monkeypatch):
+        bot = self._make_bot()
+        _install_telegram_mock(monkeypatch, bot)
+
+        result = asyncio.run(_edit_telegram("tok", "123", "99", "updated body"))
+
+        bot.edit_message_text.assert_awaited_once()
+        kwargs = bot.edit_message_text.await_args.kwargs
+        assert kwargs["chat_id"] == 123
+        assert kwargs["message_id"] == 99
+        assert result["success"] is True
+        assert result["platform"] == "telegram"
+        assert result["chat_id"] == "123"
+        assert result["message_id"] == "99"
+
+    def test_html_message_uses_html_parse_mode(self, monkeypatch):
+        bot = self._make_bot()
+        _install_telegram_mock(monkeypatch, bot)
+
+        asyncio.run(_edit_telegram("tok", "123", "99", "<b>Revogado</b>"))
+
+        kwargs = bot.edit_message_text.await_args.kwargs
+        assert kwargs["parse_mode"] == "HTML"
+        assert kwargs["text"] == "<b>Revogado</b>"
+
+    def test_plain_text_uses_markdown_v2(self, monkeypatch):
+        bot = self._make_bot()
+        _install_telegram_mock(monkeypatch, bot)
+
+        asyncio.run(_edit_telegram("tok", "123", "99", "Just plain text, no tags"))
+
+        kwargs = bot.edit_message_text.await_args.kwargs
+        assert kwargs["parse_mode"] == "MarkdownV2"
+
+    def test_message_not_modified_is_treated_as_success(self, monkeypatch):
+        """Telegram raises 'message is not modified' when the edit is a no-op;
+        the message is already in the desired state, so report success."""
+        bot = self._make_bot()
+        bot.edit_message_text = AsyncMock(
+            side_effect=Exception(
+                "Bad Request: message is not modified: specified new message "
+                "content and reply markup are exactly the same"
+            )
+        )
+        _install_telegram_mock(monkeypatch, bot)
+
+        result = asyncio.run(_edit_telegram("tok", "123", "99", "<b>same</b>"))
+
+        assert result["success"] is True
+        assert result["message_id"] == "99"
+
+    def test_parse_failure_falls_back_to_plain(self, monkeypatch):
+        """If Telegram rejects the parse mode, retry the edit as plain text."""
+        bot = self._make_bot()
+        bot.edit_message_text = AsyncMock(
+            side_effect=[
+                Exception("Bad Request: can't parse entities: unsupported html tag"),
+                SimpleNamespace(message_id=99),
+            ]
+        )
+        _install_telegram_mock(monkeypatch, bot)
+
+        result = asyncio.run(
+            _edit_telegram("tok", "123", "99", "<invalid>broken</invalid>")
+        )
+
+        assert result["success"] is True
+        assert bot.edit_message_text.await_count == 2
+        second_call = bot.edit_message_text.await_args_list[1].kwargs
+        assert second_call["parse_mode"] is None
+
+
+class TestHandleEditDispatch:
+    """send_message(action='edit') dispatch through _handle_edit (hermes#62).
+
+    The Telegram Bot one-shot send is mocked at the I/O boundary
+    (_edit_telegram) so the dispatch wiring is exercised in isolation.
+    """
+
+    def test_edit_routes_to_edit_telegram_with_ref_fields(self):
+        config, telegram_cfg = _make_config()
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch(
+                 "tools.send_message_tool._edit_telegram",
+                 new=AsyncMock(return_value={"success": True, "platform": "telegram",
+                                             "chat_id": "12345", "message_id": "99"}),
+             ) as edit_mock, \
+             patch("model_tools._run_async", side_effect=_run_async_immediately):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "edit",
+                        "message_ref": {"channel": "telegram", "chat_id": "12345",
+                                        "message_id": "99"},
+                        "message": "updated body",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        edit_mock.assert_awaited_once_with(telegram_cfg.token, "12345", "99", "updated body")
+
+    def test_edit_accepts_json_string_message_ref(self):
+        config, telegram_cfg = _make_config()
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch(
+                 "tools.send_message_tool._edit_telegram",
+                 new=AsyncMock(return_value={"success": True, "platform": "telegram",
+                                             "chat_id": "12345", "message_id": "99"}),
+             ) as edit_mock, \
+             patch("model_tools._run_async", side_effect=_run_async_immediately):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "edit",
+                        "message_ref": json.dumps(
+                            {"channel": "telegram", "chat_id": "12345",
+                             "message_id": "99"}
+                        ),
+                        "message": "updated body",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        edit_mock.assert_awaited_once_with(telegram_cfg.token, "12345", "99", "updated body")
+
+    def test_edit_missing_message_ref_errors(self):
+        result = json.loads(
+            send_message_tool({"action": "edit", "message": "x"})
+        )
+        assert "error" in result
+
+    def test_edit_message_ref_without_chat_id_errors(self):
+        result = json.loads(
+            send_message_tool(
+                {
+                    "action": "edit",
+                    "message_ref": {"channel": "telegram", "message_id": "99"},
+                    "message": "x",
+                }
+            )
+        )
+        assert "error" in result
+        assert "chat_id" in result["error"]
+
+    def test_edit_missing_message_errors(self):
+        result = json.loads(
+            send_message_tool(
+                {
+                    "action": "edit",
+                    "message_ref": {"channel": "telegram", "chat_id": "12345",
+                                    "message_id": "99"},
+                }
+            )
+        )
+        assert "error" in result
+
+    def test_edit_unsupported_platform_errors(self):
+        result = json.loads(
+            send_message_tool(
+                {
+                    "action": "edit",
+                    "message_ref": {"channel": "slack", "chat_id": "C123",
+                                    "message_id": "171.0001"},
+                    "message": "x",
+                }
+            )
+        )
+        assert "error" in result
+        assert "telegram" in result["error"].lower()
 
 
 def test_not_configured_error_names_resolved_home_and_consulted_sources(tmp_path, monkeypatch):

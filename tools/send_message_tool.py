@@ -18,7 +18,8 @@ from tools.send_message_senders import (
     _AUDIO_EXTS, _DEFAULT_CAPTION_LIMIT, _IMAGE_EXTS, _NO_DELIVERABLE, _VIDEO_EXTS, _VOICE_EXTS,
     _adapter_media_method, _error, _live_adapter, _media_caption_split, _plugin_standalone_sender,
     _registry_standalone_send, _resolve_slack_user_target, _sanitize_error_text, _send_bluebubbles,
-    _send_matrix_via_adapter, _send_qqbot, _send_signal, _send_telegram, _send_weixin, _send_yuanbao)
+    _edit_telegram, _send_matrix_via_adapter, _send_qqbot, _send_signal, _send_telegram, _send_weixin,
+    _send_yuanbao)
 from tools.registry import tool_error
 
 # NOTE: ``send_message`` is intentionally NOT registered as an agent-callable model tool
@@ -37,6 +38,8 @@ def send_message_tool(args, **kw):
     action = args.get("action", "send")
     if action == "list":
         return _handle_list()
+    if action == "edit":
+        return _handle_edit(args)
     if action in ("react", "unreact"):
         return _handle_react(args, remove=action == "unreact")
     return _handle_send(args)
@@ -152,6 +155,54 @@ def _authorize_relay_target(platform_name: str, chat_id, thread_id=None, *,
             "allowed through unchecked."
         )
 
+
+def _handle_edit(args):
+    """Edit a previously sent message in place — Telegram only (hermes#62). ``message_ref`` is the
+    reference a prior send returned (``channel``, ``chat_id``, ``message_id``; object or JSON string)."""
+    message_ref, message = args.get("message_ref"), args.get("message", "")
+    if not message_ref:
+        return tool_error("'message_ref' is required when action='edit'")
+    if not message:
+        return tool_error("'message' is required when action='edit'")
+    if isinstance(message_ref, str):
+        try:
+            message_ref = json.loads(message_ref)
+        except (ValueError, TypeError):
+            return tool_error("'message_ref' must be an object or a JSON string")
+    if not isinstance(message_ref, dict):
+        return tool_error("'message_ref' must be an object with 'channel', 'chat_id' and 'message_id'")
+    platform_name = str(message_ref.get("channel", "")).strip().lower()
+    chat_id, message_id = message_ref.get("chat_id"), message_ref.get("message_id")
+    if platform_name != "telegram":
+        return tool_error(f"action='edit' is currently only supported for telegram; "
+                          f"got channel='{platform_name or 'unknown'}'")
+    if not chat_id:
+        return tool_error("'message_ref' is missing 'chat_id' (required to edit a telegram message)")
+    if not message_id:
+        return tool_error("'message_ref' is missing 'message_id' (required to edit a telegram message)")
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return tool_error("Interrupted")
+    try:
+        from gateway.config import load_gateway_config
+        config = load_gateway_config()
+    except Exception as e:
+        return json.dumps(_error(f"Failed to load gateway config: {e}"))
+    _platform, pconfig, _entry, err = _resolve_platform_config(platform_name, config)
+    if err:
+        return tool_error(err)
+    # P5(a): an edit is an outbound act against a named destination — same egress floor as send.
+    _relay_denial = _authorize_relay_target(platform_name, chat_id, native_token=getattr(pconfig, "token", None))
+    if _relay_denial:
+        return tool_error(_relay_denial)
+    try:
+        from model_tools import _run_async
+        result = _run_async(_edit_telegram(pconfig.token, str(chat_id), str(message_id), message))
+    except Exception as e:
+        return json.dumps(_error(f"Edit failed: {e}"))
+    if isinstance(result, dict) and "error" in result:
+        result["error"] = _sanitize_error_text(result["error"])
+    return json.dumps(result)
 
 def _handle_react(args, remove=False):
     """Attach (``remove=True``: retract) an emoji reaction via the live gateway adapter; no

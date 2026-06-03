@@ -310,6 +310,38 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return _error(f"Telegram send failed: {e}")
 
 
+def _is_telegram_not_modified(error: Exception) -> bool:
+    """Editing to identical content raises "message is not modified" — a no-op, so success."""
+    return "message is not modified" in str(error).lower()
+
+
+async def _edit_telegram(token, chat_id, message_id, message):
+    """One-shot Telegram Bot API text edit (hermes#62): same formatting and proxy as
+    ``_send_telegram``; "not modified" is success; parse failures fall back to plain text."""
+    try:
+        formatted, edit_parse_mode, _has_html = _telegram_format(message)
+        bot = _telegram_bot(token)
+        from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
+        int_chat_id = normalize_telegram_chat_id(chat_id)
+        int_message_id = int(message_id)
+        try:
+            await bot.edit_message_text(
+                chat_id=int_chat_id, message_id=int_message_id, text=formatted, parse_mode=edit_parse_mode)
+        except Exception as edit_error:
+            if _is_telegram_not_modified(edit_error):
+                return _success("telegram", str(chat_id), message_id=str(message_id), not_modified=True)
+            if not any(k in str(edit_error).lower() for k in ("parse", "markdown", "html")):
+                raise
+            logger.warning("Parse mode %s failed in _edit_telegram, falling back to plain text: %s",
+                           edit_parse_mode, _sanitize_error_text(edit_error))
+            plain = message if _has_html else _strip_mdv2_safe(formatted)
+            await bot.edit_message_text(chat_id=int_chat_id, message_id=int_message_id, text=plain, parse_mode=None)
+        return _success("telegram", str(chat_id), message_id=str(message_id))
+    except ImportError:
+        return {"error": "python-telegram-bot not installed. Run: pip install python-telegram-bot"}
+    except Exception as e:
+        return _error(f"Telegram edit failed: {e}")
+
 def _live_adapter(platform, *, lookup_failed_warning=None):
     """``(runner, adapter)`` for the in-process gateway; ``(None, None)`` standalone (cron);
     ``(runner, None)`` when the lookup fails — logged when a warning is given, never silently
