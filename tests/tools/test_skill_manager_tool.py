@@ -1125,7 +1125,7 @@ class TestPinnedGuard:
 LOCKED_SKILL_CONTENT = """\
 ---
 name: locked-skill
-description: A skill that opts out of agent modification via the locked flag.
+description: Skill that opts out of agent modification.
 metadata:
   hermes:
     locked: true
