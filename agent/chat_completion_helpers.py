@@ -2277,6 +2277,30 @@ def _build_partial_stream_stub(
     )
 
 
+def bind_worker_session_context(agent) -> None:
+    """Bind ``agent.session_id`` to the CURRENT thread's log context.
+
+    The ``[session]`` tag on every log line comes from a ``threading.local``
+    in :mod:`hermes_logging`, so a worker thread starts UNBOUND: every record
+    it emits is formatted without a session tag.  In a process running
+    concurrent sessions that makes the streaming worker's own errors
+    impossible to attribute to the session that suffered them.
+
+    Best-effort by contract — an agent without ``session_id`` (test double,
+    version-skewed checkout) leaves the thread unbound instead of raising
+    inside the worker.
+    """
+    session_id = getattr(agent, "session_id", None)
+    if not session_id:
+        return
+    try:
+        from hermes_logging import set_session_context
+
+        set_session_context(session_id)
+    except Exception:
+        pass
+
+
 def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):
     """Streaming variant of _interruptible_api_call for real-time token delivery.
 
@@ -3323,6 +3347,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     def _call():
         import httpx as _httpx
 
+        bind_worker_session_context(agent)
+
         _max_stream_retries = env_int("HERMES_STREAM_RETRIES", 2)
 
         try:
@@ -3622,9 +3648,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 "   To avoid this delay, set display.streaming: false "
                                 "in config.yaml\n"
                             )
+                        # exc_info: this branch also catches client-side bugs
+                        # (an exception raised while accumulating the stream,
+                        # not a transport failure).  Without the traceback the
+                        # only trace left is the exception's str(), which does
+                        # not name the raising frame.
                         logger.info(
                             "Streaming failed before delivery: %s",
                             e,
+                            exc_info=True,
                         )
 
                     # Propagate the error to the main retry loop instead of
