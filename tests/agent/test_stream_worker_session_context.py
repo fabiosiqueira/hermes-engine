@@ -1,41 +1,218 @@
-"""Regression tests for session attribution inside the streaming worker thread.
+"""Regression tests for session attribution inside the streaming worker threads.
 
-``interruptible_streaming_api_call`` runs the provider call on a worker thread.
-The ``[session]`` tag that every log line carries comes from a
-``threading.local`` in :mod:`hermes_logging`, so that thread starts unbound and
-everything it logs is formatted WITHOUT a session tag.
+``interruptible_streaming_api_call`` runs the provider call on a worker thread
+— one for the OpenAI/Anthropic path, another for Bedrock Converse. The
+``[session]`` tag that every log line carries comes from a ``threading.local``
+in :mod:`hermes_logging`, and ``_context_thread_target`` carries the caller's
+ContextVars across the thread boundary but cannot carry a thread-local. Both
+workers therefore start UNBOUND and everything they log is formatted WITHOUT a
+session tag.
 
 In a process serving concurrent sessions this is the difference between a
-diagnosable failure and an anonymous one: the worker is where a stream failure
-is logged, so the one line carrying the cause is the one line that names no
-session.
+diagnosable failure and an anonymous one: each worker is where its own stream
+failure is logged, so the one line carrying the cause is the one line that
+names no session.
 
-These tests assert the binding's contract: it attributes the worker's records
-to the agent's session, it never leaks into the caller's thread, and it stays
-best-effort (a session-less agent or a broken logging module must not raise
-inside the worker).
+The two production-path tests below drive the real
+``interruptible_streaming_api_call`` and assert on a record emitted from INSIDE
+each worker — the placement is the point, so exercising the helper alone would
+not catch a worker that was never bound. The caller's thread is deliberately
+left unbound in both: the tag must come from ``agent.session_id``, not from
+whatever the calling thread happened to inherit.
+
+The remaining tests pin the helper's best-effort contract.
 """
 
-import contextlib
-import importlib
+from __future__ import annotations
+
 import logging
 import threading
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
-from agent.chat_completion_helpers import bind_worker_session_context
+import pytest
+
+import hermes_logging
+from agent import chat_completion_helpers as cch
+from agent.chat_completion_helpers import _bind_worker_session_context
 
 SESSION_ID = "20260101_000000_abcdef01"
+SESSION_TAG = f" [{SESSION_ID}]"
 
 
-def _live_hermes_logging():
-    """Resolve ``hermes_logging`` the way the production helper does.
+class _WorkerRecords(logging.Handler):
+    """Collect records emitted from threads other than the test's own.
 
-    Other tests in this suite reload modules, so the object bound at import
-    time is not necessarily the one ``bind_worker_session_context`` writes
-    to.  Going through ``sys.modules`` on every call keeps these tests
-    order-independent.
+    Handlers run synchronously on the emitting thread, so ``record.thread``
+    identifies the worker that created the record — which is exactly the
+    placement these tests are about.
     """
-    return importlib.import_module("hermes_logging")
 
+    def __init__(self, caller_thread_id: int):
+        super().__init__()
+        self._caller_thread_id = caller_thread_id
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.thread != self._caller_thread_id:
+            self.records.append(record)
+
+    def starting_with(self, prefix: str) -> list[logging.LogRecord]:
+        return [r for r in self.records if str(r.msg).startswith(prefix)]
+
+
+@pytest.fixture
+def worker_records():
+    """Capture worker-thread records with the caller's thread left UNBOUND."""
+    # Idempotent; other suites reload modules, so re-assert the factory that
+    # puts ``session_tag`` on every record.
+    hermes_logging._install_session_record_factory()
+    # The caller MUST stay unbound: a tag that leaked in from this thread
+    # would make the assertions pass without the worker ever being bound.
+    hermes_logging.clear_session_context()
+
+    handler = _WorkerRecords(threading.get_ident())
+    previous_level = cch.logger.level
+    cch.logger.addHandler(handler)
+    cch.logger.setLevel(logging.DEBUG)
+    try:
+        yield handler
+    finally:
+        cch.logger.removeHandler(handler)
+        cch.logger.setLevel(previous_level)
+
+
+# ── Production path: OpenAI/Anthropic streaming worker ─────────────────────
+
+def _make_agent():
+    """Real agent on the chat_completions streaming path (mirrors
+    tests/run_agent/test_partial_stream_finish_reason.py)."""
+    from run_agent import AIAgent
+
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://example.com/v1",
+        model="test/model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent.api_mode = "chat_completions"
+    agent._interrupt_requested = False
+    agent.session_id = SESSION_ID
+    return agent
+
+
+@patch("run_agent.AIAgent._close_request_openai_client")
+@patch("run_agent.AIAgent._create_request_openai_client")
+def test_standard_streaming_worker_record_carries_the_agent_session_tag(
+    mock_create, _mock_close, worker_records
+):
+    """The pre-delivery failure log is emitted from the worker thread; it used
+    to name no session, so in a concurrent process the one line carrying the
+    cause could not be attributed to the session that suffered it."""
+    mock_client = MagicMock()
+    # Not a timeout/connection/parse error, so the worker takes the
+    # "failed before delivery" branch instead of the retry path.
+    mock_client.chat.completions.create.side_effect = RuntimeError(
+        "provider returned garbage"
+    )
+    mock_create.return_value = mock_client
+
+    agent = _make_agent()
+
+    with pytest.raises(RuntimeError):
+        agent._interruptible_streaming_api_call({})
+
+    failures = worker_records.starting_with("Streaming failed before delivery")
+    assert failures, (
+        "expected the worker's pre-delivery failure log; got "
+        f"{[str(r.msg) for r in worker_records.records]}"
+    )
+    assert all(r.session_tag == SESSION_TAG for r in failures)
+
+
+# ── Production path: Bedrock Converse streaming worker ─────────────────────
+
+class _BedrockAgent:
+    """Minimal Bedrock-mode agent (mirrors
+    tests/agent/test_bedrock_interrupt_post_worker.py)."""
+
+    api_mode = "bedrock_converse"
+    _interrupt_requested = False
+    _disable_streaming = False
+    reasoning_callback = None
+    stream_delta_callback = None
+    provider = "bedrock"
+    model = "anthropic.claude-3-sonnet-20240229-v1:0"
+    _consecutive_stale_streams = 0
+    session_id = SESSION_ID
+
+    def _has_stream_consumers(self):
+        return False
+
+    def _buffer_status(self, *a, **k):
+        pass
+
+    def _claim_stream_writer(self):
+        return 1
+
+    def _fire_stream_delta(self, text):
+        pass
+
+    def _fire_tool_gen_started(self, name):
+        pass
+
+    def _fire_reasoning_delta(self, text):
+        pass
+
+    def _safe_print(self, *a, **k):
+        pass
+
+
+def test_bedrock_streaming_worker_record_carries_the_agent_session_tag(
+    worker_records,
+):
+    """The IAM stream-denial log lives in the Bedrock worker, which is a
+    separate thread from the standard path's and needs its own binding."""
+    agent = _BedrockAgent()
+
+    def _denied(**kwargs):
+        raise RuntimeError(
+            "AccessDeniedException: bedrock:InvokeModelWithResponseStream"
+        )
+
+    # The denial branch falls back to non-streaming converse() and returns a
+    # finished response in place of a stream; a non-empty ``choices`` is what
+    # relay's completed-response predicate keys on.
+    resp = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=None, finish_reason="stop")],
+        usage=None,
+        stop_reason="end_turn",
+    )
+    fake_client = SimpleNamespace(
+        converse_stream=_denied,
+        converse=lambda **kw: {"output": {}},
+    )
+
+    with patch("agent.bedrock_adapter._get_bedrock_runtime_client", return_value=fake_client), \
+         patch("agent.bedrock_adapter.is_streaming_access_denied_error", return_value=True), \
+         patch("agent.bedrock_adapter.is_stale_connection_error", return_value=False), \
+         patch("agent.bedrock_adapter.invalidate_runtime_client", lambda *a, **k: None), \
+         patch("agent.bedrock_adapter.normalize_converse_response", side_effect=lambda r: resp), \
+         patch("agent.bedrock_adapter.stream_converse_with_callbacks", return_value=resp):
+        api_kwargs = {"__bedrock_region__": "us-east-1", "__bedrock_converse__": True}
+        cch.interruptible_streaming_api_call(agent, api_kwargs)
+
+    denials = worker_records.starting_with("bedrock: converse_stream denied by IAM")
+    assert denials, (
+        "expected the Bedrock worker's IAM-denial log; got "
+        f"{[str(r.msg) for r in worker_records.records]}"
+    )
+    assert all(r.session_tag == SESSION_TAG for r in denials)
+
+
+# ── Helper contract ────────────────────────────────────────────────────────
 
 class _Agent:
     """Minimal agent-like object — only ``session_id`` matters here."""
@@ -49,25 +226,7 @@ class _SessionLessAgent:
     """An agent object that doesn't expose ``session_id`` at all."""
 
 
-@contextlib.contextmanager
-def _live_record_factory():
-    """Reinstall the session record factory from the live module.
-
-    The factory is a process-global installed at import time, so a stale
-    wrapper left behind by a module reload would read a different
-    thread-local than the one the binding writes.  The previous factory is
-    restored on exit.
-    """
-    previous_factory = logging.getLogRecordFactory()
-    logging.setLogRecordFactory(logging.LogRecord)
-    _live_hermes_logging()._install_session_record_factory()
-    try:
-        yield
-    finally:
-        logging.setLogRecordFactory(previous_factory)
-
-
-def _session_tag_of_a_new_record():
+def _new_record_session_tag():
     """``session_tag`` of a record created on the CURRENT thread."""
     record = logging.getLogger("stream-worker-test").makeRecord(
         "stream-worker-test", logging.INFO, __file__, 1, "msg", None, None
@@ -76,31 +235,24 @@ def _session_tag_of_a_new_record():
 
 
 def _session_tag_in_worker(agent):
-    """Bind + emit one LogRecord on a fresh thread; return its ``session_tag``."""
+    """Bind + create one LogRecord on a fresh thread; return its tag."""
     captured = {}
 
     def _worker():
-        bind_worker_session_context(agent)
-        captured["tag"] = _session_tag_of_a_new_record()
+        _bind_worker_session_context(agent)
+        captured["tag"] = _new_record_session_tag()
 
-    with _live_record_factory():
-        thread = threading.Thread(target=_worker)
-        thread.start()
-        thread.join()
+    hermes_logging._install_session_record_factory()
+    thread = threading.Thread(target=_worker)
+    thread.start()
+    thread.join()
     return captured["tag"]
 
 
-def test_worker_records_carry_the_agent_session_tag():
-    # Regression: this record used to be emitted unbound, so a stream failure
-    # in one of several concurrent sessions could not be attributed to any.
-    assert _session_tag_in_worker(_Agent(SESSION_ID)) == f" [{SESSION_ID}]"
-
-
 def test_binding_does_not_leak_into_the_calling_thread():
-    _live_hermes_logging().clear_session_context()
+    hermes_logging.clear_session_context()
     _session_tag_in_worker(_Agent(SESSION_ID))
-    with _live_record_factory():
-        assert _session_tag_of_a_new_record() == ""
+    assert _new_record_session_tag() == ""
 
 
 def test_session_less_agent_leaves_the_worker_unbound():
@@ -112,7 +264,7 @@ def test_binding_swallows_logging_failures(monkeypatch):
     def _boom(_session_id):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(_live_hermes_logging(), "set_session_context", _boom)
+    monkeypatch.setattr(hermes_logging, "set_session_context", _boom)
     # Best-effort by contract: the worker must run the API call even when the
     # logging module is unusable.
     assert _session_tag_in_worker(_Agent(SESSION_ID)) == ""
