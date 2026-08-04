@@ -1923,7 +1923,15 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             credential_pool=_credential_pool,
             request_overrides=_request_overrides,
             **_agent_kwargs,
-            enabled_toolsets=["skills", "terminal"],
+            # CARRY: upstream ships ["skills", "terminal"] so the fork can
+            # `mv` support files into an umbrella's references/ while
+            # consolidating. We drop `terminal`: the prompt's "DO NOT call
+            # terminal to mv skill directories into .archive/" is advisory
+            # only, and this fork is autonomous with no user in the loop — a
+            # shell it can reach archives an operator-authored skill past
+            # every guard the skill_manage path enforces. Consolidation moves
+            # are the cost; we don't use them.
+            enabled_toolsets=["skills"],
             # Umbrella-building over a large skill collection is worth a
             # high iteration ceiling — the pass typically takes 50-100
             # API calls against hundreds of candidate skills. The

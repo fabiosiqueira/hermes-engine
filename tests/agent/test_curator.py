@@ -701,17 +701,26 @@ def test_review_fork_uses_runtime_model_and_output_cap(curator_env, monkeypatch)
 
 
 
-def test_review_fork_restricts_toolsets_to_skills_and_terminal(curator_env, monkeypatch):
-    """The curator LLM fork must advertise only the skills + terminal toolsets.
+def test_review_fork_restricts_toolsets_to_skills_only(curator_env, monkeypatch):
+    """The curator LLM fork must advertise only the skills toolset.
 
-    Without ``enabled_toolsets=["skills", "terminal"]`` on the AIAgent(...) call
-    in ``_run_llm_review``, ``enabled_toolsets`` defaults to None and init_agent
-    grants the fork the full default catalog (~30 tools) plus the context_engine
-    (lcm_*) tools, billing ~7K wasted schema tokens on every one of the fork's
-    50-100 API calls per consolidation pass. The prompt (curator.py:509-523)
-    confines the model to four tools in natural language, but only this kwarg
-    filters the advertised request schema. Capturing the constructor kwarg is
-    the sole assertion that distinguishes fixed from unfixed code.
+    Without ``enabled_toolsets`` on the AIAgent(...) call in
+    ``_run_llm_review`` it defaults to None and init_agent grants the fork the
+    full default catalog (~30 tools) plus the context_engine (lcm_*) tools,
+    billing ~7K wasted schema tokens on every one of the fork's 50-100 API
+    calls per consolidation pass. The prompt (curator.py:509-523) confines the
+    model to four tools in natural language, but only this kwarg filters the
+    advertised request schema. Capturing the constructor kwarg is the sole
+    assertion that distinguishes fixed from unfixed code.
+
+    CARRY DIVERGENCE from upstream: upstream pins the fork to
+    ``["skills", "terminal"]``, keeping ``terminal`` so the fork can `mv`
+    support files into an umbrella's references/ during consolidation. We drop
+    ``terminal`` entirely: the prompt's "DO NOT call terminal to mv skill
+    directories into .archive/" is advisory, and an autonomous fork that can
+    shell out can archive an operator-authored skill past every guard the
+    ``skill_manage`` path enforces. We do not use umbrella consolidation;
+    losing it is the cheaper side of that trade.
     """
     curator = curator_env["curator"]
 
@@ -742,35 +751,40 @@ def test_review_fork_restricts_toolsets_to_skills_and_terminal(curator_env, monk
 
     # error is None proves the fork was actually constructed (capture ran).
     assert meta.get("error") is None, meta.get("error")
-    assert captured.get("enabled_toolsets") == ["skills", "terminal"], (
-        "curator review fork did not pass enabled_toolsets=['skills', "
-        "'terminal'] to AIAgent; the full default tool catalog (plus lcm_* "
-        "context_engine tools) would be advertised; got "
-        f"{captured.get('enabled_toolsets')!r}"
+    assert captured.get("enabled_toolsets") == ["skills"], (
+        "curator review fork did not pass enabled_toolsets=['skills'] to "
+        "AIAgent; with 'terminal' back in the list the fork can shell out and "
+        "mv a skill directory into .archive/ past every skill_manage guard; "
+        f"got {captured.get('enabled_toolsets')!r}"
     )
 
 
-def test_review_fork_toolset_surface_is_skills_plus_terminal():
+def test_review_fork_toolset_surface_is_skills_without_terminal():
     """Documentary check on the static surface the fork's kwarg resolves to.
 
     Registry-independent (include_registry=False) so a plugin-registered tool
     tagged into these toolsets cannot flake the membership checks. This
-    documents the intended surface (the four prompt-named tools present, dead
+    documents the intended surface (the prompt-named skill tools present, dead
     default and lcm_* schema absent) but does not itself guard the call-site
-    kwarg. No exact-set pin: intentional additions to either toolset must not
+    kwarg. No exact-set pin: intentional additions to the toolset must not
     fail this test.
+
+    ``terminal`` absent is the carry divergence (see
+    test_review_fork_restricts_toolsets_to_skills_only): resolving the surface
+    is what proves the fork cannot shell out, since a toolset the kwarg omits
+    contributes no tool schema at all.
     """
     from toolsets import resolve_toolset
 
-    surface = set(resolve_toolset("skills", include_registry=False)) | set(
-        resolve_toolset("terminal", include_registry=False)
-    )
+    surface = set(resolve_toolset("skills", include_registry=False))
 
-    # The four prompt-named tools are all present.
+    # The prompt-named skill tools are all present.
     assert "skills_list" in surface
     assert "skill_view" in surface
     assert "skill_manage" in surface
-    assert "terminal" in surface
+
+    # The shell-out escape hatch is gone.
+    assert "terminal" not in surface
 
     # Representative dropped default + context_engine tools are absent.
     assert "read_file" not in surface
