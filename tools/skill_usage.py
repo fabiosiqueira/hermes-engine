@@ -474,12 +474,36 @@ def is_curation_eligible(skill_name: str, skill_path: Optional[Path] = None) -> 
         return False
     if is_bundled(skill_name):
         return _prune_builtins_enabled()
+    if skill_path is not None and _frontmatter_locks_curation(skill_path):
+        return False
     local_dir = _find_skill_dir(skill_name)
     if local_dir is not None:
+        if _frontmatter_locks_curation(local_dir):
+            return False
         return not is_external_skill_path(local_dir)
     if _find_external_skill_dir(skill_name) is not None:
         return False
     return True
+
+
+def _frontmatter_locks_curation(skill_path: Path) -> bool:
+    """True when the skill's own SKILL.md opts out of curation via
+    ``metadata.hermes.pinned`` or ``metadata.hermes.locked``.
+
+    Fail-open like ``_locked_guard`` in skill_manager_tool.py: a missing or
+    unparseable SKILL.md never blocks curation on its own.
+    """
+    try:
+        skill_md = skill_path / "SKILL.md" if skill_path.is_dir() else skill_path
+        if not skill_md.exists():
+            return False
+        from agent.skill_utils import parse_frontmatter
+        fm, _body = parse_frontmatter(skill_md.read_text(encoding="utf-8"))
+        hermes_meta = (fm.get("metadata") or {}).get("hermes") or {}
+        return hermes_meta.get("pinned") is True or hermes_meta.get("locked") is True
+    except Exception:
+        logger.debug("frontmatter lock lookup failed for %s", skill_path, exc_info=True)
+        return False
 
 
 def _is_curator_managed_record(record: Any) -> bool:

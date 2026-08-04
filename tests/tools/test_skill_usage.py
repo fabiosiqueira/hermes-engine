@@ -202,6 +202,48 @@ def test_is_agent_created(skills_home):
 # Archive / restore
 # ---------------------------------------------------------------------------
 
+def test_curation_eligible_honors_frontmatter_pinned(skills_home):
+    from tools.skill_usage import is_curation_eligible
+    skills_dir = skills_home / "skills"
+    d = skills_dir / "pinned-skill"
+    d.mkdir()
+    (d / "SKILL.md").write_text(
+        "---\n"
+        "name: pinned-skill\n"
+        "description: test skill\n"
+        "metadata:\n"
+        "  hermes:\n"
+        "    pinned: true\n"
+        "---\n\n# body\n",
+        encoding="utf-8",
+    )
+    assert is_curation_eligible("pinned-skill", d / "SKILL.md") is False
+
+
+def test_curation_eligible_honors_frontmatter_locked(skills_home):
+    from tools.skill_usage import is_curation_eligible
+    skills_dir = skills_home / "skills"
+    d = skills_dir / "locked-skill"
+    d.mkdir()
+    (d / "SKILL.md").write_text(
+        "---\n"
+        "name: locked-skill\n"
+        "description: test skill\n"
+        "metadata:\n"
+        "  hermes:\n"
+        "    locked: true\n"
+        "---\n\n# body\n",
+        encoding="utf-8",
+    )
+    assert is_curation_eligible("locked-skill", d / "SKILL.md") is False
+
+
+def test_curation_eligible_ignores_frontmatter_without_flags(skills_home):
+    from tools.skill_usage import is_curation_eligible
+    skills_dir = skills_home / "skills"
+    d = _write_skill(skills_dir, "plain-skill")
+    assert is_curation_eligible("plain-skill", d / "SKILL.md") is True
+
 
 # ---------------------------------------------------------------------------
 # Reporting
