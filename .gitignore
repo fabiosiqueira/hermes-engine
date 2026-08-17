@@ -204,3 +204,6 @@ native/fts5_cjk/*.so
 
 # Local memory-search tool cache, unrelated to repo content (seen 2026-08-16).
 .memsearch/
+
+# Agent skills/config are local tooling, never fork content (leaked publicly once, 2026-08-17).
+.claude/
