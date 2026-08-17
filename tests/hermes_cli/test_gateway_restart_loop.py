@@ -967,6 +967,63 @@ class TestRestartLoopGuard:
         rlg.clear()
         assert rlg.check_and_record(3, 60, now=1002.0) is False
 
+    def test_trips_on_slow_crash_cycle_wider_than_window(self):
+        """#81642: a ~150s crash cycle is wider than the 60s window, so the
+        old absolute-window prune dropped the previous boot on every boot and
+        the counter never left 1.  Chaining on the inter-boot gap sees it."""
+        import gateway.restart_loop_guard as rlg
+        assert rlg.check_and_record(3, 60, now=1000.0) is False
+        assert rlg.check_and_record(3, 60, now=1150.0) is False
+        assert rlg.check_and_record(3, 60, now=1300.0) is True
+
+    def test_slow_cycle_chain_is_persisted_not_truncated(self):
+        """The state file must keep the whole chain — the reported symptom was
+        a restart_loop.json holding a single timestamp after 15 crashes."""
+        import gateway.restart_loop_guard as rlg
+        rlg.record_restart_interrupted_boot(60, now=1000.0)
+        rlg.record_restart_interrupted_boot(60, now=1150.0)
+        boots = rlg.record_restart_interrupted_boot(60, now=1300.0)
+        assert boots == [1000.0, 1150.0, 1300.0]
+
+    def test_quiet_period_breaks_the_chain(self):
+        """A boot after real quiet starts a fresh chain, so occasional
+        operator restarts never accumulate into a trip."""
+        import gateway.restart_loop_guard as rlg
+        rlg.check_and_record(3, 60, now=1000.0)
+        rlg.check_and_record(3, 60, now=1150.0)
+        # 1h later: unrelated restart, chain reset to a single boot.
+        assert rlg.check_and_record(3, 60, now=4800.0) is False
+        assert rlg.is_restart_loop_tripped(3, 60, now=4801.0) is False
+
+    def test_fast_respawn_loop_still_trips(self):
+        """#30719 regression: the original ~10s loop must keep tripping."""
+        import gateway.restart_loop_guard as rlg
+        assert rlg.check_and_record(3, 60, now=1000.0) is False
+        assert rlg.check_and_record(3, 60, now=1010.0) is False
+        assert rlg.check_and_record(3, 60, now=1020.0) is True
+
+    def test_max_gap_seconds_is_configurable(self):
+        """An operator can narrow the chain gap back down; a cycle slower than
+        the configured gap then stops chaining."""
+        import gateway.restart_loop_guard as rlg
+        assert rlg.check_and_record(3, 60, now=1000.0, max_gap_seconds=100) is False
+        assert rlg.check_and_record(3, 60, now=1150.0, max_gap_seconds=100) is False
+        assert rlg.check_and_record(3, 60, now=1300.0, max_gap_seconds=100) is False
+
+    def test_window_seconds_floors_the_gap(self):
+        """A window wider than the gap default still governs, so raising
+        window_seconds never makes the breaker less sensitive."""
+        import gateway.restart_loop_guard as rlg
+        assert rlg.check_and_record(3, 900, now=1000.0, max_gap_seconds=100) is False
+        assert rlg.check_and_record(3, 900, now=1400.0, max_gap_seconds=100) is False
+        assert rlg.check_and_record(3, 900, now=1800.0, max_gap_seconds=100) is True
+
+    def test_disabled_breaker_never_trips(self):
+        import gateway.restart_loop_guard as rlg
+        for ts in (1000.0, 1150.0, 1300.0, 1450.0):
+            assert rlg.check_and_record(0, 60, now=ts) is False
+        assert rlg.is_restart_loop_tripped(0, 60, now=1451.0) is False
+
 class TestTerminalToolGatewayLifecycleGuardRemote:
     """Remote-backend and two-session cwd regression coverage."""
 
@@ -1043,3 +1100,188 @@ class TestCronCreateLifecycleBlockExtra:
         assert rc == 1
         out = capsys.readouterr().out
         assert "Blocked" in out
+
+class TestLifecycleGuardDataArgumentExemption:
+    """Lifecycle words inside DATA arguments (SQL text, grep patterns) must
+    not block; the same words in command position must. Reproduces the two
+    live false positives (Aug 2026): a sqlite3 SELECT over restart-history
+    text and a grep for the lifecycle string in syslog."""
+
+    def _scan(self, command, **kwargs):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        return contains_gateway_lifecycle_command_or_referenced_script(
+            command, **kwargs
+        )
+
+    @pytest.mark.parametrize("command", [
+        # Exact live false-positive shapes: SQL string literals carrying the
+        # full lifecycle command as text.
+        'sqlite3 db "SELECT msg FROM log WHERE msg LIKE '
+        "'%systemctl restart hermes-gateway%'\"",
+        'psql -c "SELECT * FROM events WHERE cmd = '
+        "'systemctl stop hermes-gateway'\"",
+        # grep/rg pattern arguments hunting for the lifecycle string.
+        "grep -c 'systemctl restart hermes-gateway' /var/log/syslog",
+        "rg 'hermes gateway restart' /home/user/.hermes/logs/",
+        "journalctl -u hermes-gateway --grep 'systemctl restart hermes-gateway'",
+        # SQL with stop/restart column/value words but no command shape.
+        'sqlite3 stats.db "SELECT stop_time, restart_reason FROM '
+        'hermes_gateway_restarts"',
+        "psql -c \"SELECT count(*) FROM events WHERE action IN "
+        "('stop','restart') AND service LIKE '%gateway%'\"",
+    ])
+    def test_data_argument_lifecycle_text_not_blocked(self, command):
+        assert self._scan(command) is False
+
+    @pytest.mark.parametrize("command", [
+        # Execution smuggled through or around a data sink must still block.
+        'sqlite3 db ".shell hermes gateway restart"',
+        'psql -c "\\! systemctl restart hermes-gateway"',
+        "grep 'systemctl restart hermes-gateway' cmds.txt | sh",
+        "grep gateway f | xargs systemctl restart hermes-gateway",
+        'grep "$(systemctl restart hermes-gateway)" f',
+        "grep 'restart' log; systemctl restart hermes-gateway",
+        'sqlite3 db "SELECT 1"; hermes gateway stop',
+        # Plain lifecycle commands are unaffected by the exemption.
+        "hermes gateway restart",
+        "sudo systemctl stop hermes-gateway",
+    ])
+    def test_command_position_lifecycle_still_blocked(self, command):
+        assert self._scan(command) is True
+
+    def test_python_script_branch_gets_the_same_exemption(self, tmp_path):
+        """check_gateway_lifecycle's .py branch scans the combined
+        prompt+script text with the direct regex; a shell-shaped diagnostic
+        command in the PROMPT (the live false-positive shape) must not block
+        a job that runs a clean .py script. Note the exemption is
+        fail-closed: the same SQL buried in non-shell-shaped Python source
+        (e.g. inside a subprocess.run list literal) stays blocked because
+        the masker cannot prove it is data."""
+        from cron.lifecycle_guard import check_gateway_lifecycle
+        script = tmp_path / "report.py"
+        script.write_text("print('nightly report')\n", encoding="utf-8")
+        prompt = (
+            'sqlite3 db "SELECT msg FROM log '
+            "WHERE msg LIKE '%systemctl restart hermes-gateway%'\""
+        )
+        check_gateway_lifecycle(prompt, str(script))
+
+
+class TestLifecycleGuardNeverRaises:
+    """The guard must return a verdict for every input — binary referenced
+    paths, NUL bytes, non-UTF-8, /dev/* nodes, directories, missing files —
+    never crash (the live 'ValueError: embedded null byte' class)."""
+
+    def _scan(self, command, **kwargs):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        return contains_gateway_lifecycle_command_or_referenced_script(
+            command, **kwargs
+        )
+
+    def test_command_referencing_elf_binary_returns_false(self, tmp_path):
+        """The exact live crash shape: a command referencing a compiled
+        executable path (e.g. a venv python) must scan as 'nothing', not
+        crash on the binary's decoded bytes."""
+        binary = tmp_path / "python3.11"
+        binary.write_bytes(b"\x7fELF\x02\x01\x01" + bytes(64) + b"\x90" * 256)
+        assert self._scan(f"{binary} -m json.tool /tmp/x.json") is False
+
+    @pytest.mark.parametrize("command", [
+        "run /tmp/foo\x00bar/baz.sh",
+        "bash ./run\x00me.sh",
+        "bash /nonexistent/deeply/missing.sh",
+        "bash /" + "a" * 4096 + ".sh",  # ENAMETOOLONG
+    ])
+    def test_adversarial_paths_never_raise(self, command):
+        assert self._scan(command, cwd="/tmp") is False
+
+    def test_non_utf8_referenced_file_never_raises(self, tmp_path):
+        weird = tmp_path / "weird.sh"
+        weird.write_bytes(b"\xff\xfe\x00\x01 not really a script")
+        assert self._scan(f"bash {weird}") is False
+
+    def test_sourced_zshrc_docker_completions_dir_is_not_blocked(self, tmp_path):
+        """#86753: Docker Desktop writes ``fpath=(~/.docker/completions …)``
+        into ``.zshrc``. Completions is a directory. The walk must treat
+        that as nothing-to-scan, not fail-closed, or ``source ~/.zshrc``
+        is blocked on every terminal command."""
+        completions = tmp_path / ".docker" / "completions"
+        completions.mkdir(parents=True)
+        zshrc = tmp_path / ".zshrc"
+        zshrc.write_text(
+            f"fpath=({completions} /usr/local/share/zsh/site-functions $fpath)\n",
+            encoding="utf-8",
+        )
+        assert self._scan(f"source {zshrc}") is False
+
+    def test_fstat_directory_mode_is_not_unsafe(self, tmp_path, monkeypatch):
+        """#86753 Unix contract: os.open(dir) succeeds, fstat is not S_ISREG.
+
+        Windows raises OSError on os.open(dir) and already returns
+        nothing-to-scan. Linux/macOS open the directory and used to
+        return unsafe=True, blocking sourced zshrcs that mention
+        ``~/.docker/completions``.
+        """
+        import os
+        import stat as statmod
+
+        from cron.lifecycle_guard import _read_referenced_script
+
+        probe = tmp_path / "probe"
+        probe.write_text("echo hi\n", encoding="utf-8")
+        orig = os.fstat
+
+        def _dir_fstat(fd):
+            orig(fd)
+            class _DirStat:
+                st_mode = statmod.S_IFDIR | 0o755
+            return _DirStat()
+
+        monkeypatch.setattr(os, "fstat", _dir_fstat)
+        text, unsafe = _read_referenced_script(probe)
+        assert text is None
+        assert unsafe is False
+
+    def test_directory_and_dev_null_fail_closed_not_crash(self, tmp_path):
+        # Directories are not scripts (#86753). Devices stay fail-closed
+        # where the OS actually exposes them (POSIX /dev/null).
+        # The important contract is: verdict, not exception.
+        assert self._scan(f"bash {tmp_path}") is False
+        if os.name != "nt":
+            assert self._scan("bash /dev/null") is True
+
+    def test_magic_prefix_binaries_skipped_without_full_read(self, tmp_path):
+        """Executable magic (ELF/PE/Mach-O) short-circuits the read: the
+        guard must not treat compiled binaries as scripts at all."""
+        from cron.lifecycle_guard import _read_referenced_script
+        for name, magic in [
+            ("elf", b"\x7fELF"),
+            ("pe", b"MZ"),
+            ("macho", b"\xcf\xfa\xed\xfe"),
+            ("fat", b"\xca\xfe\xba\xbe"),
+        ]:
+            path = tmp_path / name
+            # No NUL after the magic — proves the magic check itself fires.
+            path.write_bytes(magic + b"ABCDEF" * 10)
+            text, unsafe = _read_referenced_script(path)
+            assert text is None, name
+            assert unsafe is False, name
+
+    def test_check_gateway_lifecycle_adversarial_script_values(self, tmp_path):
+        """check_gateway_lifecycle must never raise anything but the
+        documented GatewayLifecycleBlocked for junk script values."""
+        from cron.lifecycle_guard import (
+            GatewayLifecycleBlocked,
+            check_gateway_lifecycle,
+        )
+        binary = tmp_path / "prog"
+        binary.write_bytes(b"\x7fELF" + bytes(128))
+        for value in ("nul\x00byte.sh", str(binary), "/nonexistent/x.sh", str(tmp_path)):
+            check_gateway_lifecycle("clean prompt", value)  # must not raise
+        if os.name != "nt":
+            with pytest.raises(GatewayLifecycleBlocked):
+                check_gateway_lifecycle("clean prompt", "/dev/null")
