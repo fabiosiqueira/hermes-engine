@@ -241,9 +241,13 @@ test('log trimming keeps watermarks consistent', () => {
   assert.equal(watermarks.builder, 0)
 })
 
-test('source contract: workspace + header affordance + prompt rules are wired', () => {
+test('source contract: workspace + main-window door + prompt rules are wired', () => {
   assert.match(pluginSource, /function GroupChatWorkspace\(/)
-  assert.match(pluginSource, /Open chat/)
+  // Group rows open through the main-window door, feature-detected with the
+  // in-panel room as the older-desktop fallback.
+  assert.match(pluginSource, /function openGroupChat\(/)
+  assert.match(pluginSource, /typeof host\.openWorkspace === 'function'/)
+  assert.match(pluginSource, /\$groupChatWorkspace\.set\(group\)/)
   assert.match(pluginSource, /reply with exactly "\(pass\)"/i)
   assert.match(pluginSource, /\[Group chat: "\$\{groupName\}"\]/)
 })
@@ -361,4 +365,20 @@ test('source contract: workspace speaker labels use displayName with a click-to-
   // gateway/device name appended for cross-connection speakers.
   assert.match(pluginSource, /setRevealedSpeaker\(revealed \? null : entryKey\)/)
   assert.match(pluginSource, /\$\{display\}\$\{entry\.from\.source \? `-\$\{entry\.from\.source\}` : ''\} \(@\$\{botHandle\(entry\.from\.name, member \|\| undefined\)\}\)/)
+})
+
+test('source contract: room messages carry the speaker avatar via the roster appearance pipeline', () => {
+  const start = pluginSource.indexOf('function GroupChatWorkspace(')
+  const end = pluginSource.indexOf('function BotsPane(')
+  const workspace = pluginSource.slice(start, end === -1 ? undefined : end)
+
+  // Per-message avatar: appearance resolved the same way as BotRow (custom
+  // image/pet honored, backfilled PNG dropped so the math face animates).
+  assert.match(workspace, /botAppearance\(entry\.from\.name, meta\)/)
+  assert.match(workspace, /image && !isBackfilledFacePng\(image\)/)
+  assert.match(workspace, /jsx\(BotFace, \{\s*shape,\s*color,\s*image: photo \? image : null,\s*size: 24,\s*name: entry\.from\.name/)
+
+  // Header shows the member faces (capped) with a names tooltip.
+  assert.match(workspace, /members\.slice\(0, 6\)\.map\(/)
+  assert.match(workspace, /title: members\.map\(b => displayName\(b, botRosterMeta\(b, allMeta\)\)\)\.join\(', '\)/)
 })
