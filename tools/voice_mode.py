@@ -1013,6 +1013,10 @@ def play_audio_file(file_path: str) -> bool:
     """Play an audio file; True on success. WAV via ``sounddevice.play()`` when allowed,
     else system players: afplay (macOS), WSL2 PowerShell bridge, ffplay, aplay (Linux).
     Interruptible via ``stop_playback()``."""
+    # Process-wide kill switch (#88898): headless/agent/CI contexts can set
+    # this once instead of relying on every entry point being mocked.
+    if os.environ.get("HERMES_TTS_NO_PLAYBACK", "").strip() == "1":
+        return False
     mark_audio_output_active(True)  # ref-count real speaker output for the whole call
     try:
         return _play_audio_file_impl(file_path)
