@@ -1726,6 +1726,36 @@ class SendResult:
     error_kind: Optional[str] = None
 
 
+def delivered_message_count(result: Any) -> int:
+    """How many platform messages one :class:`SendResult` actually delivered.
+
+    A single logical reply becomes N platform messages whenever the payload overflows the
+    per-message cap.  Adapters report that fan-out in two shapes — Telegram's ``send()`` returns
+    the full id list under ``raw_response["message_ids"]``, while the edit-overflow path reports
+    the extra ids in ``continuation_message_ids`` — so consumers that need the count (outbound
+    accounting, the ``message:sent`` hook) read it here rather than re-deriving it per platform.
+    Returns 0 for a failed send and falls back to 1 for an adapter that reports neither shape.
+    """
+    if result is None or not getattr(result, "success", False):
+        return 0
+    raw = getattr(result, "raw_response", None)
+    if isinstance(raw, dict):
+        ids = raw.get("message_ids")
+        if isinstance(ids, (list, tuple)) and ids:
+            return len(ids)
+    return 1 + len(getattr(result, "continuation_message_ids", ()) or ())
+
+
+def outbound_slash_command(event: Any) -> str:
+    """Slash command that triggered ``event``, or "" for a free-form message.  Both halves of the
+    outbound-delivery hook (the adapter reply path and the gateway's streamed path) label a send
+    with it, so they cannot disagree about what counts as a command."""
+    text = str(getattr(event, "text", "") or "").strip()
+    if not text.startswith("/"):
+        return ""
+    return text.split(maxsplit=1)[0][1:].lower()
+
+
 # Longest server ``retry_after`` ``_send_with_retry`` will sleep inline. Longer penalties return the
 # typed failure so the delivery ledger owns the wait (#91969: a 97-minute FloodWait slept verbatim
 # pinned the send coroutine and froze inbound on every platform).
@@ -4415,6 +4445,45 @@ class BasePlatformAdapter(ABC):
         if getattr(event, "_turn_marker_handoff", False) and getattr(event, "_gateway_active_turn_token", None):
             await self.gateway_runner._clear_durable_active_turn(event)
 
+    @staticmethod
+    def _outbound_reply_origin(event: MessageEvent) -> str:
+        """Lane that caused this outbound reply: the operator driving the agent from chat
+        (``command`` — slash or free-form, answered identically) or the gateway feeding itself a
+        background notification (``internal``).  Autonomous lanes (cron, webhook) deliver through
+        their own paths and label themselves there."""
+        return "internal" if getattr(event, "internal", False) else "command"
+
+    async def _emit_message_sent_hook(
+        self, event: MessageEvent, result: Any, *, origin: str, session_key: str = "",
+        content: str = "",
+    ) -> None:
+        """Fire ``message:sent`` for one delivered outbound reply.  ``agent:end`` reports that a
+        turn finished, never that anything reached the chat, so a host watching channel volume
+        could not see the replies the agent sends back to the operator
+        (fabiosiqueira/hermes-binance#124).  Best-effort by contract: a missing runner, a missing
+        hook registry, or a raising handler must never affect delivery."""
+        try:
+            emit = getattr(getattr(self.gateway_runner, "hooks", None), "emit", None)
+            if not callable(emit):
+                return
+            source = getattr(event, "source", None)
+            platform = getattr(source, "platform", None)
+            await emit("message:sent", {
+                "platform": str(getattr(platform, "value", platform) or ""),
+                "chat_id": str(getattr(source, "chat_id", "") or ""),
+                "thread_id": str(getattr(source, "thread_id", "") or ""),
+                "chat_type": str(getattr(source, "chat_type", "") or ""),
+                "user_id": str(getattr(source, "user_id", "") or ""),
+                "session_key": session_key or "",
+                "origin": origin,
+                "slash_command": outbound_slash_command(event),
+                "messages": delivered_message_count(result),
+                "chars": len(content or ""),
+                "success": bool(getattr(result, "success", False)),
+            })
+        except Exception:
+            logger.debug("[%s] message:sent hook emit failed", self.name, exc_info=True)
+
     async def _send_final_text(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any],
         is_ephemeral_response: bool, ephemeral_ttl: int, record_delivery: Callable) -> None:
@@ -4423,6 +4492,9 @@ class BasePlatformAdapter(ABC):
             event, session_key, text_content, metadata,
             reply_to=_reply_anchor_for_event(event), is_ephemeral_response=is_ephemeral_response)
         record_delivery(result)
+        await self._emit_message_sent_hook(
+            event, result, origin=self._outbound_reply_origin(event), session_key=session_key,
+            content=text_content)
         if ephemeral_ttl and ephemeral_ttl > 0 and result.success and result.message_id:
             delivery_adapter._schedule_ephemeral_delete(event.source.chat_id, result.message_id, ephemeral_ttl)
 

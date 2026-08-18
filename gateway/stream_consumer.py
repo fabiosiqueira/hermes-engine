@@ -152,6 +152,9 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         # would be stale by completion time. Ported from openclaw/openclaw#72038.
         self._preview_message_ids: set[str] = set()
         self._already_sent = False
+        # Platform messages this consumer created (``messages_created`` / ``_counted_send``).
+        # Turn-scoped: a segment break resets the edit target, not the tally.
+        self._messages_created = 0
         self._edit_supported = True  # False once progressive edits stop working
         self._last_edit_time = 0.0
         self._last_edit_overflowed = False  # last _send_or_edit split into continuations
@@ -515,7 +518,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                        "falling back to send() for pre-prompt text (chat=%s)",
                        _reason, self.chat_id)
         try:
-            if getattr(await self.adapter.send(self.chat_id, finalize_text), "success", False):
+            if getattr(await self._counted_send(self.chat_id, finalize_text), "success", False):
                 return True
         except Exception as send_err:
             logger.warning("%s boundary: fallback send also failed: %s", _reason, send_err)

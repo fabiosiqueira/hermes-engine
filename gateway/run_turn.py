@@ -1913,6 +1913,33 @@ class GatewayTurnMixin:
         # trigger a rebuild next turn (destroying prompt caching).
         await self._refresh_agent_cache_message_count(session_key, sid)
 
+    async def _emit_streamed_message_sent(
+        self, event, source, session_entry, session_key, agent_result, response, _footer_line,
+    ) -> None:
+        """Outbound accounting (#124) for a streamed reply.  The adapter-side ``message:sent``
+        never fires here — the handler returns None because streaming already put the reply on
+        screen — so publish the same facts with the count the stream consumer tallied.
+        Fail-soft: accounting must not break a delivered turn."""
+        try:
+            from gateway.platforms.base import outbound_slash_command
+            _sent_count = int(agent_result.get("delivered_messages") or 0) + (1 if _footer_line else 0)
+            await self.hooks.emit("message:sent", {
+                "platform": source.platform.value if source.platform else "",
+                "user_id": source.user_id,
+                "chat_id": source.chat_id or "",
+                "thread_id": str(source.thread_id) if getattr(source, "thread_id", None) else "",
+                "chat_type": getattr(source, "chat_type", "") or "",
+                "session_id": session_entry.session_id,
+                "session_key": session_key or "",
+                "origin": "internal" if getattr(event, "internal", False) else "command",
+                "slash_command": outbound_slash_command(event),
+                "messages": _sent_count,
+                "chars": len(response or ""),
+                "success": True,
+            })
+        except Exception:
+            logger.debug("message:sent hook emit failed (streamed)", exc_info=True)
+
     async def _hmwa_deliver_turn_response(
         self, event, source, session_entry, session_key, run_generation,
         agent_result, agent_messages, response, _footer_line, _intentional_silence,
@@ -1949,6 +1976,8 @@ class GatewayTurnMixin:
                     await adapter.send(source.chat_id, _footer_line, metadata=self._event_thread_metadata(event, source))
                 except Exception as _e:
                     logger.debug("trailing footer send failed: %s", _e)
+            await self._emit_streamed_message_sent(
+                event, source, session_entry, session_key, agent_result, response, _footer_line)
             # Return None so the body isn't sent twice; stash the delivered text on the event for the
             # /loop and /goal hooks that read the return value.
             with suppress(Exception):
@@ -4049,6 +4078,10 @@ class GatewayTurnMixin:
         payload: a mismatch (False, incl. payload-less split delivery) never suppresses; None (no
         record) keeps legacy trust."""
         _sc, source, session_key = turn_ctx.stream_consumer_holder[0], turn_ctx.source, turn_ctx.session_key
+        # Outbound accounting (#124): carry the streamed message count out of the consumer so the
+        # message:sent hook can report it on the already_sent path, where no adapter send happens.
+        if isinstance(response, dict) and _sc is not None:
+            response["delivered_messages"] = int(getattr(_sc, "messages_created", 0) or 0)
         if not isinstance(response, dict) or response.get("failed"):
             return
         _final = response.get("final_response") or ""

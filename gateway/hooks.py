@@ -3,10 +3,18 @@
 Hooks live in ~/.hermes/hooks/<name>/ with HOOK.yaml (name, description, events) and
 handler.py (``def handle(event_type, context)``, sync or async); errors never block
 the pipeline.  Events: gateway:startup, session:start/end/reset, agent:start,
-agent:step (each tool-loop turn), agent:end, command:* (wildcard).  agent:* context:
+agent:step (each tool-loop turn), agent:end, message:sent, command:* (wildcard).  agent:* context:
 platform, user_id, chat_id, thread_id ("" outside a thread), chat_type
 ("dm"|"group"|"forum"|""), session_id, message (500 chars); agent:end adds response,
 model, provider.  Forum follow-ups pass ``message_thread_id=int(thread_id)``.
+
+message:sent fires once per reply that actually reached the chat (plain send and streaming
+paths) — agent:end says a turn finished, which is not outbound volume: a turn can end silently
+and one turn can occupy several platform messages.  Context: platform, chat_id, thread_id,
+chat_type, user_id (as above); session_key; origin ("command" = operator driving the agent
+from chat, slash or free-form; "internal" = gateway self-injected notification — autonomous
+lanes label themselves at their own delivery paths); slash_command (name without "/", "" for
+free-form); messages (platform messages occupied, 0 on failure); chars; success.
 """
 
 import asyncio

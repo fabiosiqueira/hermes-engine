@@ -28,6 +28,26 @@ class StreamTransportMixin:
 
     _MIN_NEW_MSG_CHARS = 4
 
+    @property
+    def messages_created(self) -> int:
+        """Platform messages this consumer created for the current turn (outbound accounting,
+        fabiosiqueira/hermes-binance#124).  Edits are free — only a fresh send adds to the tally,
+        so a preview retracted and re-sent counts both: "messages this turn put on the wire"."""
+        return getattr(self, "_messages_created", 0)
+
+    async def _counted_send(self, *args, **kwargs):
+        """``adapter.send`` wrapper that tallies the messages it creates.  Every streaming send
+        site (first send, sealed overflow heads, fallback finals, commentary, replacements for a
+        retracted preview) routes through here, so the total stays honest without each site
+        remembering, and an adapter fanning one send across several messages counts right."""
+        result = await self.adapter.send(*args, **kwargs)
+        try:
+            from gateway.platforms.base import delivered_message_count
+            self._messages_created = getattr(self, "_messages_created", 0) + delivered_message_count(result)
+        except Exception:  # accounting must never break delivery
+            logger.debug("stream consumer send accounting failed", exc_info=True)
+        return result
+
     async def _edit_message(self, *, message_id: str, content: str, finalize: bool = False):
         """Edit via the adapter, passing routing metadata when supported."""
         # Contract: adapters must accept finalize= even when False (test-guarded).
@@ -281,7 +301,7 @@ class StreamTransportMixin:
             return False
         stale_ids = self._stale_preview_ids()
         try:
-            result = await self.adapter.send(
+            result = await self._counted_send(
                 chat_id=self.chat_id, content=text, metadata=self._metadata_for_send(final=True))
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
@@ -457,7 +477,7 @@ class StreamTransportMixin:
                 "declined this destination for this run"
             )
             return False
-        result = await self.adapter.send(
+        result = await self._counted_send(
             chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
             metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize))
         if not result.success:
