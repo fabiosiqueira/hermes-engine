@@ -861,6 +861,18 @@ def render_notice_line(notice) -> str:
     return str(getattr(notice, "text", "") or "").strip()
 
 
+def _outbound_slash_command_of(event) -> str:
+    """Thin delegate to the adapter-layer parser so both delivery-hook call
+    sites (adapter reply path, streamed path here) label a send identically."""
+    try:
+        from gateway.platforms.base import outbound_slash_command
+
+        return outbound_slash_command(event)
+    except Exception:
+        logger.debug("slash-command label unavailable for delivery hook", exc_info=True)
+        return ""
+
+
 async def _send_or_update_status_coro(adapter, chat_id, status_key, content, metadata):
     """Route a status message through adapter.send_or_update_status when supported.
 
@@ -20543,6 +20555,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     event._streamed_final_response = str(response or "")
                 except Exception:
                     pass
+                # Outbound accounting (#124).  The adapter-side delivery hook
+                # never fires on this path — the handler returns None because
+                # streaming already put the reply on screen — so publish the
+                # same ``message:sent`` facts here, using the count the stream
+                # consumer tallied.  Fail-soft: accounting must not break a
+                # delivered turn.
+                try:
+                    _sent_count = int(agent_result.get("delivered_messages") or 0)
+                    if _footer_line:
+                        _sent_count += 1
+                    await self.hooks.emit("message:sent", {
+                        **hook_ctx,
+                        "session_key": session_key or "",
+                        "origin": "internal" if getattr(event, "internal", False) else "command",
+                        "slash_command": _outbound_slash_command_of(event),
+                        "messages": _sent_count,
+                        "chars": len(response or ""),
+                        "success": True,
+                    })
+                except Exception:
+                    logger.debug("message:sent hook emit failed (streamed)", exc_info=True)
                 return None
 
             return response
@@ -29331,6 +29364,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # final answer.  Suppressing delivery here leaves the user staring
         # at silence.  (#10xxx — "agent stops after web search")
         _sc = stream_consumer_holder[0]
+        # Outbound accounting (#124): carry the streamed message count out of
+        # the consumer so the delivery hook can report it even on the
+        # already_sent path, where no adapter send happens at the gateway
+        # boundary.
+        if isinstance(response, dict) and _sc is not None:
+            response["delivered_messages"] = int(
+                getattr(_sc, "messages_created", 0) or 0
+            )
         if isinstance(response, dict) and not response.get("failed"):
             _final = response.get("final_response") or ""
             _is_empty_sentinel = not _final or _final == "(empty)"

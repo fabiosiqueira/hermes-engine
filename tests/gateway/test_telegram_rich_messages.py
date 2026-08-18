@@ -162,7 +162,9 @@ async def test_expect_edits_metadata_keeps_preview_on_legacy_path():
 async def test_oversized_content_skips_rich_and_chunks():
     adapter = _make_adapter()
     # > 32,768 characters -> rich pre-check fails, legacy chunking takes over.
-    oversized = "a" * 40000
+    # Varied filler, not a repeated character: a degenerate repeated payload
+    # is suppressed by the outbound flood guard before it can chunk.
+    oversized = ("oversized legacy chunking body " * 1400)[:40000]
     assert len(oversized) > TelegramAdapter.RICH_MESSAGE_MAX_CHARS
 
     result = await adapter.send("12345", oversized)

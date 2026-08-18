@@ -205,7 +205,10 @@ class TestFinalOverflowSplits:
         )
         channel, sends = _wire_channel(adapter, original_msg=msg)
 
-        big = "q" * 6000  # ~3-4 chunks at 2000 cap
+        # Varied filler, not a repeated character: the outbound flood guard
+        # (gateway/outbound_flood_guard.py) collapses a degenerate repeated
+        # payload into one notice, which is not what this test exercises.
+        big = ("overflow continuation body " * 300)[:6000]  # ~3-4 chunks at 2000 cap
         result = await adapter.edit_message("555", "42", big, finalize=True)
 
         assert result.success is True

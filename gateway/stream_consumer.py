@@ -242,6 +242,10 @@ class GatewayStreamConsumer:
         # must never delete an earlier finalized preamble/commentary message.
         self._segment_preview_message_ids: "set[str]" = set()
         self._already_sent = False
+        # Platform messages created by this consumer, for outbound accounting
+        # (see ``messages_created`` / ``_counted_send``).  Turn-scoped: a
+        # segment break resets the edit target, not the tally.
+        self._messages_created = 0
         self._edit_supported = True  # Disabled when progressive edits are no longer usable
         self._last_edit_time = 0.0
         self._last_sent_text = ""   # Track last-sent text to skip redundant edits
@@ -1262,6 +1266,37 @@ class GatewayStreamConsumer:
         """
         return _BasePlatformAdapter.strip_media_directives_for_display(text)
 
+    @property
+    def messages_created(self) -> int:
+        """Platform messages this consumer created for the current turn.
+
+        Outbound accounting (fabiosiqueira/hermes-binance#124) needs the count
+        of chat messages a streamed reply actually produced.  Edits are free —
+        only a fresh send adds to the tally, which means a preview that was
+        retracted and re-sent counts both sends: the tally is "messages this
+        turn put on the wire", not "messages still visible afterwards".
+        """
+        return self._messages_created
+
+    async def _counted_send(self, *args, **kwargs):
+        """``adapter.send`` wrapper that tallies the messages it creates.
+
+        The streaming path opens new chat messages from seven call sites
+        (first send, sealed overflow heads, fallback finals, replacements for
+        a retracted preview).  Routing them all through one wrapper is the
+        only way to get an honest total without asking each site to remember,
+        and keeps the count correct when an adapter fans a single send out
+        across several platform messages.
+        """
+        result = await self.adapter.send(*args, **kwargs)
+        try:
+            from gateway.platforms.base import delivered_message_count
+
+            self._messages_created += delivered_message_count(result)
+        except Exception:  # accounting must never break delivery
+            logger.debug("stream consumer send accounting failed", exc_info=True)
+        return result
+
     async def _send_new_chunk(
         self,
         text: str,
@@ -1277,7 +1312,7 @@ class GatewayStreamConsumer:
         if not text.strip():
             return reply_to_id
         try:
-            result = await self.adapter.send(
+            result = await self._counted_send(
                 chat_id=self.chat_id,
                 content=text,
                 reply_to=reply_to_id,
@@ -1493,7 +1528,7 @@ class GatewayStreamConsumer:
             # Try sending with one retry on flood-control errors.
             result = None
             for attempt in range(2):
-                result = await self.adapter.send(
+                result = await self._counted_send(
                     chat_id=self.chat_id,
                     content=chunk,
                     metadata=self._metadata_for_send(final=True),
@@ -1595,7 +1630,7 @@ class GatewayStreamConsumer:
         result = None
         for attempt in range(2):
             try:
-                result = await self.adapter.send(
+                result = await self._counted_send(
                     chat_id=self.chat_id,
                     content=final_text,
                     metadata=self._metadata_for_send(final=True),
@@ -1799,7 +1834,7 @@ class GatewayStreamConsumer:
         if not tail.strip():
             return
         try:
-            result = await self.adapter.send(
+            result = await self._counted_send(
                 chat_id=self.chat_id,
                 content=tail,
                 metadata=self.metadata,
@@ -1836,7 +1871,7 @@ class GatewayStreamConsumer:
         if not text.strip():
             return False
         try:
-            result = await self.adapter.send(
+            result = await self._counted_send(
                 chat_id=self.chat_id,
                 content=text,
                 metadata=self.metadata,
@@ -1991,7 +2026,7 @@ class GatewayStreamConsumer:
         if self._message_id and self._message_id != "__no_edit__":
             stale_ids.add(self._message_id)
         try:
-            result = await self.adapter.send(
+            result = await self._counted_send(
                 chat_id=self.chat_id,
                 content=text,
                 metadata=self._metadata_for_send(final=True),
@@ -2392,7 +2427,7 @@ class GatewayStreamConsumer:
             else:
                 # First message — send new, threaded to the original user message
                 # so it lands in the correct topic/thread.
-                result = await self.adapter.send(
+                result = await self._counted_send(
                     chat_id=self.chat_id,
                     content=text,
                     reply_to=self._initial_reply_to_id,

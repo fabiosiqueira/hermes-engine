@@ -577,6 +577,14 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.outbound_flood_guard import (
+    DEGENERATE_MIN_CHUNKS,
+    cap_chunk_fanout,
+    degenerate_repetition_guard_enabled,
+    degenerate_repetition_notice,
+    describe_degenerate_repetition,
+    resolve_max_outbound_chunks,
+)
 from gateway.session import SessionSource, build_session_key
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
 
@@ -2494,6 +2502,41 @@ class SendResult:
     # ``None`` (unset / not classified).  Producers should set this via
     # :func:`classify_send_error`.
     error_kind: Optional[str] = None
+
+
+def delivered_message_count(result: Any) -> int:
+    """How many platform messages one :class:`SendResult` actually delivered.
+
+    A single logical reply becomes N platform messages whenever the payload
+    overflows the per-message cap.  Adapters report that fan-out in two
+    different shapes — Telegram's ``send()`` returns the full id list under
+    ``raw_response["message_ids"]``, while the edit-overflow path reports the
+    extra ids in ``continuation_message_ids`` — so consumers that need the
+    count (outbound accounting, the ``message:sent`` hook) read it here rather
+    than re-deriving it per platform.  Returns 0 for a failed send and falls
+    back to 1 for an adapter that reports neither shape.
+    """
+    if result is None or not getattr(result, "success", False):
+        return 0
+    raw = getattr(result, "raw_response", None)
+    if isinstance(raw, dict):
+        ids = raw.get("message_ids")
+        if isinstance(ids, (list, tuple)) and ids:
+            return len(ids)
+    return 1 + len(getattr(result, "continuation_message_ids", ()) or ())
+
+
+def outbound_slash_command(event: Any) -> str:
+    """Slash command that triggered ``event``, or "" for a free-form message.
+
+    Both halves of the outbound-delivery hook (the adapter reply path and the
+    gateway's streamed path) label a send with it, so they derive it from one
+    place and cannot disagree about what counts as a command.
+    """
+    text = str(getattr(event, "text", "") or "").strip()
+    if not text.startswith("/"):
+        return ""
+    return text.split(maxsplit=1)[0][1:].lower()
 
 
 # Machine-readable send-failure categories.  Kept platform-neutral so every
@@ -6223,6 +6266,65 @@ class BasePlatformAdapter(ABC):
             max_ms = 2500
         return random.uniform(min_ms / 1000.0, max_ms / 1000.0)
 
+    @staticmethod
+    def _outbound_reply_origin(event: MessageEvent) -> str:
+        """Lane that caused this outbound reply.
+
+        Outbound volume is attributable only if every send carries the lane
+        that produced it.  This seam runs for replies to an inbound platform
+        message, which is either the operator driving the agent from chat
+        (``command`` — a slash command or a free-form message, the two the
+        agent answers identically) or the gateway feeding itself a background
+        notification (``internal``).  Autonomous lanes (cron, webhook) deliver
+        through their own paths and label themselves there.
+        """
+        return "internal" if getattr(event, "internal", False) else "command"
+
+    async def _emit_message_sent_hook(
+        self,
+        event: MessageEvent,
+        result: Any,
+        *,
+        origin: str,
+        session_key: str = "",
+        content: str = "",
+    ) -> None:
+        """Fire ``message:sent`` for one delivered outbound reply.
+
+        The gateway had no outbound accounting at all: ``agent:end`` reports
+        that a turn finished, never that anything reached the chat, so a host
+        watching channel volume could see the autonomous lanes it drives
+        itself but never the replies the agent sends back to the operator
+        (fabiosiqueira/hermes-binance#124).  This publishes the delivery facts
+        — lane, chat, message count — on the existing hook bus so a host hook
+        can mirror them into whatever counter it already keeps.
+
+        Best-effort by contract: a missing runner, a missing hook registry, or
+        a raising handler must never affect delivery.
+        """
+        try:
+            runner = getattr(self._message_handler, "__self__", None)
+            emit = getattr(getattr(runner, "hooks", None), "emit", None)
+            if not callable(emit):
+                return
+            source = getattr(event, "source", None)
+            platform = getattr(source, "platform", None)
+            await emit("message:sent", {
+                "platform": str(getattr(platform, "value", platform) or ""),
+                "chat_id": str(getattr(source, "chat_id", "") or ""),
+                "thread_id": str(getattr(source, "thread_id", "") or ""),
+                "chat_type": str(getattr(source, "chat_type", "") or ""),
+                "user_id": str(getattr(source, "user_id", "") or ""),
+                "session_key": session_key or "",
+                "origin": origin,
+                "slash_command": outbound_slash_command(event),
+                "messages": delivered_message_count(result),
+                "chars": len(content or ""),
+                "success": bool(getattr(result, "success", False)),
+            })
+        except Exception:
+            logger.debug("[%s] message:sent hook emit failed", self.name, exc_info=True)
+
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         # Track delivery outcomes for the processing-complete hook
@@ -6553,6 +6655,13 @@ class BasePlatformAdapter(ABC):
                         metadata=_final_thread_metadata,
                     )
                     _record_delivery(result)
+                    await self._emit_message_sent_hook(
+                        event,
+                        result,
+                        origin=self._outbound_reply_origin(event),
+                        session_key=session_key,
+                        content=text_content,
+                    )
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
@@ -7346,6 +7455,37 @@ class BasePlatformAdapter(ABC):
                 carry_lang = None
 
             chunks.append(full_chunk)
+
+        # Flood guard (#118).  A degenerate decoder loop must surface as ONE
+        # visible error rather than as a burst of chat messages of repeated
+        # noise.  Gated on the real chunk count, not on length: a repetitive
+        # payload that fits in a couple of messages is not a flood, and the
+        # split has to happen anyway to know which case this is.
+        if (
+            len(chunks) > DEGENERATE_MIN_CHUNKS
+            and degenerate_repetition_guard_enabled()
+        ):
+            _degenerate = describe_degenerate_repetition(content)
+            if _degenerate is not None:
+                logger.error(
+                    "Degenerate outbound payload suppressed: unit=%r repeats=%d "
+                    "chars=%d chunks=%d",
+                    _degenerate.unit[:8], _degenerate.repeats,
+                    _degenerate.length, len(chunks),
+                )
+                return [degenerate_repetition_notice(_degenerate)]
+
+        # Bound the fan-out before numbering (#118): whatever the content, one
+        # reply must not become an unbounded burst of platform messages.  The
+        # dropped tail is replaced by a visible notice, never silently cut.
+        _capped = cap_chunk_fanout(chunks)
+        if len(_capped) != len(chunks):
+            logger.error(
+                "Outbound fan-out capped: %d chunks requested, %d delivered "
+                "(HERMES_MAX_OUTBOUND_CHUNKS=%d)",
+                len(chunks), len(_capped), resolve_max_outbound_chunks(),
+            )
+            chunks = _capped
 
         # Append chunk indicators when the response spans multiple messages
         if len(chunks) > 1:

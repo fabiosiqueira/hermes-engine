@@ -14,6 +14,7 @@ Events:
   - agent:start         -- Agent begins processing a message
   - agent:step          -- Each turn in the tool-calling loop
   - agent:end           -- Agent finishes processing
+  - message:sent        -- A reply was delivered to the chat platform
   - command:*           -- Any slash command executed (wildcard match)
 
 Errors in hooks are caught and logged but never block the main pipeline.
@@ -32,6 +33,27 @@ Context dict passed to ``agent:start`` / ``agent:end`` handlers:
   response     -- agent response text (truncated to 500 chars)
   model        -- model name that handled the turn
   provider     -- provider that handled the turn
+
+Context dict passed to ``message:sent`` handlers.  ``agent:end`` says a turn
+finished; this says something actually reached the chat, which is what
+outbound-volume accounting needs — the two are not the same event (a turn can
+end silently, and one turn can occupy several platform messages):
+  platform, chat_id, thread_id, chat_type, user_id -- as above
+  session_key  -- gateway session key for the conversation
+  origin       -- lane that produced the send: "command" (the operator driving
+                  the agent from chat, whether by slash command or free-form
+                  message) or "internal" (a gateway self-injected
+                  notification).  Autonomous lanes label themselves at their
+                  own delivery paths.
+  slash_command-- command name without the leading "/", "" for free-form
+  messages     -- platform messages this delivery occupied (a long reply is
+                  split across several); 0 when the send failed
+  chars        -- length of the delivered text
+  success      -- whether the platform accepted the delivery
+
+The event fires once per delivered reply, on both the plain send path and the
+streaming path.  Handlers are best-effort: a raising handler never affects
+delivery.
 
 Handlers posting a follow-up into the same Telegram forum-topic should
 include ``message_thread_id=int(thread_id)`` when ``chat_type == "forum"``
