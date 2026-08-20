@@ -248,6 +248,72 @@ function recalledEdgeWeights(paneId: string): [number, number] | undefined {
   return validShare(share) ? [1 - share, share] : undefined
 }
 
+// HIDE-ONLY STRIP TABS (`hideOnly` chrome: sessions / Bots) — standing chrome
+// whose tab must never grow a ✕. Show/hide replaces Close for them: the zone
+// menu's Show/Hide rows and the auto-registered ⌘K toggles both land here.
+// Persisted separately from `$hiddenTreePanes` (whose persistence each side
+// binding owns) so a hidden Bots tab stays hidden across launches even though
+// dock enforcement re-adopts the pane into the sessions zone every boot.
+const HIDDEN_STRIP_TAB_KEY = 'hermes.desktop.hiddenStripTabs.v1'
+
+export const $hiddenStripTabs = atom<ReadonlySet<string>>(new Set(readJson<string[]>(HIDDEN_STRIP_TAB_KEY) ?? []))
+
+function saveHiddenStripTabs(next: ReadonlySet<string>) {
+  $hiddenStripTabs.set(next)
+  writeJson(HIDDEN_STRIP_TAB_KEY, next.size === 0 ? null : [...next])
+}
+
+export function isStripTabHidden(paneId: string): boolean {
+  return $hiddenStripTabs.get().has(paneId)
+}
+
+/** Would hiding `paneId` leave its zone with no visible tab? Hiding the last
+ *  one strands an empty zone (or collapses the whole sidebar with no strip
+ *  left to right-click), so the setter refuses and says why. */
+function isLastShownInGroup(paneId: string): boolean {
+  const tree = $layoutTree.get()
+  const group = tree ? findGroupOfPane(tree, paneId) : null
+
+  if (!group) {
+    return false
+  }
+
+  const hidden = $hiddenTreePanes.get()
+
+  return !group.panes.some(id => id !== paneId && !hidden.has(id))
+}
+
+/** Show/hide a hide-only chrome tab (the Close replacement for `hideOnly`
+ *  panes). Returns false when the hide was refused — the zone must keep at
+ *  least one visible tab, so the LAST shown tab can't be hidden. */
+export function setStripTabHidden(paneId: string, hidden: boolean): boolean {
+  if (hidden && isLastShownInGroup(paneId)) {
+    notify({
+      kind: 'info',
+      title: translateNow('zones.lastTabKeptTitle'),
+      message: translateNow('zones.lastTabKeptBody')
+    })
+
+    return false
+  }
+
+  const next = toggledSet($hiddenStripTabs.get(), paneId, hidden)
+
+  if (next) {
+    saveHiddenStripTabs(next)
+  }
+
+  setTreePaneHidden(paneId, hidden)
+
+  return true
+}
+
+// Boot hydration: re-apply persisted hides through the same chrome-hidden set
+// the strips render from ($hiddenTreePanes starts empty every launch).
+for (const paneId of $hiddenStripTabs.get()) {
+  setTreePaneHidden(paneId, true)
+}
+
 const paneClosers: Record<string, () => void> = {}
 const paneOpeners: Record<string, () => void> = {}
 
@@ -314,16 +380,6 @@ export function registerLayoutResetHandler(fn: () => void): () => void {
  *  target when nothing is DOM-focused (activeElement is often `body` after a
  *  click lands on a non-focusable surface). Tracked by trackActiveTreeGroup. */
 export const $activeTreeGroup = atom<null | string>(null)
-
-/** Bumped whenever a pane's contributed STRIP TOOLS change shape (a toggle
- *  flipped, a handle registered). The strip reads `stripTools()` during render,
- *  so it needs one signal to re-read — generic on purpose: the tree knows
- *  nothing about what any pane's tools mean. */
-export const $stripToolsRevision = atom(0)
-
-export function invalidateStripTools() {
-  $stripToolsRevision.set($stripToolsRevision.get() + 1)
-}
 
 /** Record the interacted zone (pointerdown / focusin). Idempotent. */
 export function noteActiveTreeGroup(groupId: null | string) {
@@ -418,6 +474,12 @@ const isUncloseablePane = (paneId: string): boolean =>
   Boolean(
     (registry.getArea('panes').find(c => c.id === paneId)?.data as { uncloseable?: boolean } | undefined)?.uncloseable
   )
+
+/** Hide-only chrome tabs (sessions / Bots): excluded from every close verb —
+ *  Close-others / Close-all sweeping the sessions strip must not take standing
+ *  chrome with it. They hide through `setStripTabHidden` instead. */
+export const isHideOnlyPane = (paneId: string): boolean =>
+  Boolean((registry.getArea('panes').find(c => c.id === paneId)?.data as { hideOnly?: boolean } | undefined)?.hideOnly)
 
 /** A pane that belongs to a CHAT tab strip — the workspace or a session tile.
  *  Chat surfaces only: this gates where a session may DOCK (drops, ⌘T's "+"),
@@ -516,8 +578,8 @@ function closeableTreeSiblings(paneId: string): { others: string[]; right: strin
   const idx = panes.indexOf(paneId)
 
   return {
-    others: panes.filter(id => id !== paneId && !isUncloseablePane(id)),
-    right: panes.filter((id, i) => i > idx && !isUncloseablePane(id))
+    others: panes.filter(id => id !== paneId && !isUncloseablePane(id) && !isHideOnlyPane(id)),
+    right: panes.filter((id, i) => i > idx && !isUncloseablePane(id) && !isHideOnlyPane(id))
   }
 }
 
@@ -525,7 +587,11 @@ function closeableTreeSiblings(paneId: string): { others: string[]; right: strin
 export function treeTabCloseTargets(paneId: string): { all: number; others: number; right: number } {
   const { others, right } = closeableTreeSiblings(paneId)
 
-  return { all: others.length + (isUncloseablePane(paneId) ? 0 : 1), others: others.length, right: right.length }
+  return {
+    all: others.length + (isUncloseablePane(paneId) || isHideOnlyPane(paneId) ? 0 : 1),
+    others: others.length,
+    right: right.length
+  }
 }
 
 /**
@@ -567,7 +633,32 @@ export function closeAllTreeTabs(paneId: string): void {
   const tree = $layoutTree.get()
   const panes = (tree ? findGroupOfPane(tree, paneId) : null)?.panes ?? []
 
-  panes.filter(id => !isUncloseablePane(id)).forEach(closeTabPane)
+  panes.filter(id => !isUncloseablePane(id) && !isHideOnlyPane(id)).forEach(closeTabPane)
+}
+
+/** Hide-only chrome tabs in `groupId` (sessions / Bots), with live hidden
+ *  state — the zone menu's Show/Hide rows. Resolved when the menu OPENS (same
+ *  contract as the close-verb counts), never subscribed from a zone render. */
+export function hideOnlyZoneTabs(groupId: string): { hidden: boolean; id: string; title: string }[] {
+  const tree = $layoutTree.get()
+  const group = tree ? findGroup(tree, groupId) : null
+
+  if (!group) {
+    return []
+  }
+
+  const panes = registry.getArea('panes')
+  const hidden = $hiddenTreePanes.get()
+
+  return group.panes.flatMap(id => {
+    const pane = panes.find(p => p.id === id)
+
+    if (!(pane?.data as { hideOnly?: boolean } | undefined)?.hideOnly) {
+      return []
+    }
+
+    return [{ hidden: hidden.has(id), id, title: String(pane?.title ?? id) }]
+  })
 }
 
 /** Pane ids in the tree under a `${prefix}:` namespace — lets a mirror prune
@@ -933,6 +1024,12 @@ export function revealTreePane(paneId: string) {
     adoptContributedPanes()
   }
 
+  // Reveal beats a hide too: clear the persisted hide-only record, or the
+  // pane pops back hidden on the next launch even though it's on screen now.
+  if ($hiddenStripTabs.get().has(paneId)) {
+    saveHiddenStripTabs(toggledSet($hiddenStripTabs.get(), paneId, false) ?? $hiddenStripTabs.get())
+  }
+
   const side = treeSideOfPane(paneId)
 
   if (side && $collapsedTreeSides.get().has(side)) {
@@ -1105,43 +1202,40 @@ interface PaneDockHint {
   pos: DropPosition
   /** Center docks: stack BEFORE this pane id (the strip divider's slot). */
   before?: null | string
-  /** One-time re-home token: a pane ALREADY adopted under an older dock hint
-   *  moves onto this hint's center anchor once per token — never when the
-   *  user has placed the pane themselves. See `healDockedPanes`. */
-  heal?: string
+  /** Enforced dock invariant: the pane is re-homed onto this hint's anchor
+   *  on EVERY boot when it isn't already in the declared relationship —
+   *  no one-time token, and user placement does not exempt it. Once per
+   *  adoption lifetime (per boot), so an intra-session drag sticks until the
+   *  next boot. See `enforceDockedPanes`. */
+  enforce?: boolean
 }
 
-// One-time dock heals already applied, persisted so a heal runs exactly once
-// per pane per token across boots (and never re-fights a user who re-arranges
-// the healed pane afterward).
-const DOCK_HEAL_KEY = 'hermes.desktop.paneDockHeals.v1'
+// The retired one-time dock-heal ledger (`heal: '<token>'` hints). Its guards
+// (token burned even when the heal was skipped; $userPlacedPanes exempt) left
+// exactly the users who had fought the old stacked layout stuck with it —
+// enforced docks (`enforce: true`) replaced it. Drop the stale key.
+writeKey('hermes.desktop.paneDockHeals.v1', null)
 
-const appliedDockHeals = new Set<string>(readJson<string[]>(DOCK_HEAL_KEY) ?? [])
-
-function markDockHealApplied(token: string) {
-  appliedDockHeals.add(token)
-  writeJson(DOCK_HEAL_KEY, [...appliedDockHeals])
-}
+// Panes already enforced THIS boot: the invariant re-asserts at boot, not
+// against a live user — a mid-session drag out of the anchor strip sticks
+// until the next launch, so there is never a tug-of-war.
+const enforcedDocksThisBoot = new Set<string>()
 
 /**
- * A `panes` contribution whose dock hint carries a `heal` token gets ONE
- * chance to re-home its already-adopted pane onto the hint's anchor —
- * adoption is once per pane lifetime (the persisted tree remembers it), so a
- * contribution whose default dock CHANGED would otherwise never reach
- * existing installs. Guarded hard:
- *
- *  - the token burns exactly once per pane (idempotent across boots), and it
- *    burns even when the heal is skipped, so a user who later drags the pane
- *    back to the old spot is never fought;
- *  - a USER-PLACED pane ($userPlacedPanes) is never touched — their spot wins;
- *  - center re-homes only: a heal exists to consolidate a stray split into
- *    its anchor's tab strip, not to re-run arbitrary splits.
+ * A `panes` contribution whose dock hint carries `enforce: true` is re-homed
+ * onto the hint's anchor at every boot's first adoption pass when it isn't
+ * already docked there. Unlike the retired one-time heal, nothing
+ * exempts the pane — not a burned token, not $userPlacedPanes — because the
+ * hint is the owner's standing invariant about where the pane lives
+ * (Bot Mode's Bots pane IS the SESSIONS | BOTS tab strip), not a one-shot
+ * migration. Center hints consolidate panes into their anchor's tab strip;
+ * edge hints restore the declared split beside their anchor.
  *
  * Silent like adoption — the anchor zone keeps its active tab. The center
  * insert pins the zone's header shown, which is the point: the strip is how
- * the user finds the healed tab.
+ * the user finds the tab.
  */
-function healDockedPanes(
+function enforceDockedPanes(
   tree: LayoutNode,
   dataOf: (paneId: string) => { dock?: PaneDockHint; placement?: string } | undefined
 ): LayoutNode {
@@ -1150,27 +1244,48 @@ function healDockedPanes(
   for (const pane of registry.getArea('panes')) {
     const dock = dataOf(pane.id)?.dock
 
-    if (!dock?.heal || dock.pos !== 'center' || !allPaneIds(next).includes(pane.id)) {
+    if (!dock?.enforce || !allPaneIds(next).includes(pane.id)) {
       continue
     }
 
-    const token = `${pane.id}:${dock.heal}`
-
-    if (appliedDockHeals.has(token)) {
+    if (enforcedDocksThisBoot.has(pane.id)) {
       continue
     }
 
-    markDockHealApplied(token)
-
-    if ($userPlacedPanes.get().has(pane.id)) {
-      continue
-    }
+    enforcedDocksThisBoot.add(pane.id)
 
     const from = findGroupOfPane(next, pane.id)
     const anchor = findGroupOfPane(next, dock.pane)
 
-    // Already stacked with its anchor, or the anchor isn't in the tree.
-    if (!from || !anchor || from.id === anchor.id) {
+    if (!from || !anchor) {
+      continue
+    }
+
+    if (dock.pos === 'center' && from.id === anchor.id) {
+      // Already stacked with its anchor — but an enforced tab must be
+      // REACHABLE, not just co-located. Community regression (Aug 2026):
+      // persisted trees where the enforced pane was center-stacked with the
+      // strip hidden and itself active left the ANCHOR invisible with no
+      // strip to switch back ("my ui only shows bots now... cant find the
+      // sessions"). An enforced zone always shows its strip.
+      if (anchor.headerHidden === true) {
+        next = setGroupHeaderHiddenOp(next, anchor.id, false) ?? next
+      }
+
+      continue
+    }
+
+    if (dock.pos !== 'center') {
+      const moved = movePaneOp(next, pane.id, {
+        groupId: anchor.id,
+        pos: dock.pos,
+        before: dock.before
+      })
+
+      if (moved !== next) {
+        next = moved
+      }
+
       continue
     }
 
@@ -1205,9 +1320,9 @@ function adoptContributedPanes(): void {
 
   const dismissed = $dismissedPanes.get()
 
-  // One-time dock heals run FIRST: a heal re-homes a pane that is ALREADY in
-  // the tree, so the missing-pane adoption below never sees it.
-  const healed = healDockedPanes(tree, dataOf)
+  // Enforced dock invariants run FIRST: they re-home panes that are ALREADY
+  // in the tree, so the missing-pane adoption below never sees them.
+  const healed = enforceDockedPanes(tree, dataOf)
 
   // `placement: 'floating'` opts OUT of the tree entirely — those panes render
   // as fixed cards above it (renderer/floating-panes.tsx). Adopting one would
@@ -1802,6 +1917,13 @@ export function resetLayoutTree() {
   // placement back to the app (user-placed pins cleared).
   saveDismissed(new Set())
   saveUserPlaced(new Set())
+
+  // Hide-only chrome tabs (sessions / Bots) come back too — clear their
+  // persisted hides through the setter so $hiddenTreePanes agrees.
+  for (const paneId of [...$hiddenStripTabs.get()]) {
+    setStripTabHidden(paneId, false)
+  }
+
   $layoutTree.set(defaultTree)
   markActivePreset('default')
   // Owners PRE-PLACE their panes into the fresh default (session tiles stack
