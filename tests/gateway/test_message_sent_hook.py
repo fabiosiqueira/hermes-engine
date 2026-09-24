@@ -50,9 +50,7 @@ def _adapter_with_hooks():
     hooks.emit = AsyncMock()
     runner = MagicMock()
     runner.hooks = hooks
-    handler = MagicMock()
-    handler.__self__ = runner
-    adapter._message_handler = handler
+    adapter.gateway_runner = runner
     return adapter, hooks
 
 
@@ -177,7 +175,7 @@ class TestMessageSentHook:
 
     def test_no_runner_is_a_no_op(self):
         adapter = object.__new__(_StubAdapter)
-        adapter._message_handler = None
+        adapter.gateway_runner = None
         asyncio.run(adapter._emit_message_sent_hook(
             _event(),
             SendResult(success=True, message_id="10"),
