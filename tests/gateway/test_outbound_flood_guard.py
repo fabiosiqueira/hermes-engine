@@ -62,11 +62,17 @@ class TestDegenerateRepetitionDetector:
 
 class TestChunkFanoutCap:
     def test_caps_and_leaves_a_visible_notice(self):
-        capped = cap_chunk_fanout([f"chunk{i}" for i in range(30)], max_chunks=5)
+        chunks = [f"{i:04d}" + "x" * 4092 for i in range(30)]  # Telegram-sized messages
+        capped = cap_chunk_fanout(chunks, max_chunks=5)
         assert len(capped) == 5
-        assert capped[:4] == ["chunk0", "chunk1", "chunk2", "chunk3"]
+        assert capped[:4] == chunks[:4]
         assert "26" in capped[-1]  # 30 - 4 kept = 26 suppressed
         assert "truncated" in capped[-1].lower()
+
+    def test_budget_is_characters_not_message_count(self):
+        """Many short messages (WeCom's 2048-byte cap) within the text budget all go out."""
+        chunks = ["数据" * 340 for _ in range(30)]  # 30 messages, 20.4k chars < 12 * 4096
+        assert cap_chunk_fanout(chunks, max_chunks=12) == chunks
 
     def test_under_the_cap_is_untouched(self):
         chunks = [f"chunk{i}" for i in range(4)]
