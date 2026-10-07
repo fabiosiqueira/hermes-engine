@@ -34,6 +34,9 @@ from typing import List, Optional, Sequence
 # reads in a chat window, and an order of magnitude below the #118 incident.
 DEFAULT_MAX_OUTBOUND_CHUNKS = 12
 
+# One budget unit = one Telegram message, the platform the default above was calibrated on.
+OUTBOUND_CHARS_PER_CHUNK = 4096
+
 # A degenerate payload that fits in this many platform messages is noise, not
 # a flood, and is delivered as-is: the guard exists to stop a burst, not to
 # police repetitive content.
@@ -141,8 +144,8 @@ def chunk_cap_notice(dropped: int, max_chunks: int) -> str:
     """Visible replacement for the tail of an over-long multi-message reply."""
     return (
         f"⚠️ Reply truncated: {dropped:,} more message(s) were suppressed by "
-        f"the outbound flood cap ({max_chunks} messages per reply). The full "
-        "text is in the session transcript. Raise or disable the cap with "
+        f"the outbound flood cap ({max_chunks} Telegram-sized messages per reply). "
+        "The full text is in the session transcript. Raise or disable the cap with "
         "HERMES_MAX_OUTBOUND_CHUNKS."
     )
 
@@ -151,17 +154,24 @@ def cap_chunk_fanout(
     chunks: Sequence[str],
     max_chunks: Optional[int] = None,
 ) -> List[str]:
-    """Bound a split reply to ``max_chunks`` platform messages.
+    """Bound a split reply to ``max_chunks`` Telegram-sized messages' worth of text.
 
-    The last kept slot carries a visible notice instead of content, so the
-    truncation is never silent.  ``max_chunks <= 0`` disables the cap.
+    The budget is characters (``max_chunks * OUTBOUND_CHARS_PER_CHUNK``), not the raw message
+    count: a platform with a short per-message cap (WeCom's 2048 bytes) splits a modest cron
+    report into many messages, and counting those would cut legitimate output the #118 burst
+    never resembled.  Over budget, the kept head fits in ``max_chunks - 1`` units and the last
+    slot carries a visible notice, so the truncation is never silent.  ``max_chunks <= 0``
+    disables the cap.
     """
     result = list(chunks)
     limit = resolve_max_outbound_chunks() if max_chunks is None else max_chunks
-    if limit <= 0 or len(result) <= limit:
+    if limit <= 0 or sum(len(c) for c in result) <= limit * OUTBOUND_CHARS_PER_CHUNK:
         return result
-    if limit == 1:
-        return [chunk_cap_notice(len(result), limit)]
-    kept = result[: limit - 1]
-    kept.append(chunk_cap_notice(len(result) - (limit - 1), limit))
+    keep_budget, used, kept = (limit - 1) * OUTBOUND_CHARS_PER_CHUNK, 0, []
+    for chunk in result:
+        if used + len(chunk) > keep_budget:
+            break
+        kept.append(chunk)
+        used += len(chunk)
+    kept.append(chunk_cap_notice(len(result) - len(kept), limit))
     return kept
