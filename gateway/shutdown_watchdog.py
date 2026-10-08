@@ -12,10 +12,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import faulthandler
+import hashlib
 import json
 import logging
 import os
+import stat
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -43,6 +46,8 @@ DEFAULT_LOOP_WATCHDOG_TIMEOUT_S = 10.0
 DEFAULT_LOOP_WATCHDOG_MAX_STRIKES = 3
 _HEARTBEAT_RELATIVE = ("state", "gateway.heartbeat")
 _WATCHDOG_DUMP_RELATIVE = ("logs", "gateway-shutdown-watchdog.log")
+_MAX_UNIX_PATH = 100  # sun_path limit is 104 on macOS/BSD, 108 on Linux; margin for the NUL
+_TICK_SOCKET_FALLBACK_PREFIX = "hermes-lt-"
 
 
 def _coerce_float(value: Any, default: float, floor: float = 0.0) -> float:
@@ -188,6 +193,15 @@ def get_loop_heartbeat_path(home: Optional[Path] = None) -> Path:
     return _home(home).joinpath(*_HEARTBEAT_RELATIVE)
 
 
+def _fits_sun_path(path: Path) -> bool:
+    return len(str(path).encode("utf-8")) <= _MAX_UNIX_PATH
+
+
+def _tick_socket_fallback_prefix(home: Path) -> str:
+    digest = hashlib.sha256(str(Path(home).expanduser().resolve(strict=False)).encode("utf-8")).hexdigest()
+    return f"{_TICK_SOCKET_FALLBACK_PREFIX}{digest[:16]}"
+
+
 def get_loop_tick_socket_path(home: Optional[Path] = None, pid: Optional[int] = None) -> Path:
     """``<HERMES_HOME>/state/gateway.loop-tick.<pid>.sock`` — PID-suffixed so a stale node from a
     dead process is never mistaken for this gateway's witness. Served by the loop itself
@@ -196,9 +210,30 @@ def get_loop_tick_socket_path(home: Optional[Path] = None, pid: Optional[int] = 
     Served by the gateway loop itself (see ``_tick_socket_handler``): an answer is direct proof that the
     loop is dispatching, which is exactly the property the heartbeat file lost when its write moved off-loop
     (#90502).
+
+    When that path exceeds ``sun_path`` (a long ``HERMES_HOME``) the node moves to
+    ``hermes-lt-<home hash>.<pid>.sock`` under ``tempfile.gettempdir()``, then ``/tmp`` (the same
+    fallback as ``gateway.control_socket``); if neither fits the tempdir candidate is returned anyway
+    and the bind fails non-fatally.
     """
     pid = int(pid if pid is not None else os.getpid())
-    return _home(home) / "state" / f"gateway.loop-tick.{pid}.sock"
+    root = _home(home)
+    direct = root / "state" / f"gateway.loop-tick.{pid}.sock"
+    if _fits_sun_path(direct):
+        return direct
+    name = f"{_tick_socket_fallback_prefix(root)}.{pid}.sock"
+    candidates = [Path(tempfile.gettempdir()) / name] + ([] if os.name != "posix" else [Path("/tmp") / name])  # no-tmp: ok — AF_UNIX 104-byte path limit needs the short /tmp candidate
+    return next((c for c in candidates if _fits_sun_path(c)), candidates[0])
+
+
+def is_trusted_tick_socket(path: Path) -> bool:
+    """True when ``path`` is a socket node (not a symlink to one) owned by our uid. The long-home
+    fallback lives in a shared temp dir, where another user could plant a node that answers."""
+    try:
+        node = path.lstat()
+        return stat.S_ISSOCK(node.st_mode) and node.st_uid == os.getuid()  # windows-footgun: ok — AF_UNIX witness is POSIX-only
+    except (OSError, AttributeError):
+        return False
 
 
 def get_shutdown_watchdog_dump_path(home: Optional[Path] = None) -> Path:
@@ -331,13 +366,22 @@ def _sweep_stale_tick_sockets(own_path: Path) -> None:
     """Unlink loop-tick socket nodes left by dead PIDs (POSIX only; never raises).
     create_unix_server removes a leftover node at OUR path (os._exit / SIGKILL skip the
     finally-unlink) but not SIBLING nodes from other dead PIDs. os.kill(pid, 0) is a liveness
-    probe only on POSIX (Windows would TerminateProcess)."""
+    probe only on POSIX (Windows would TerminateProcess). In the shared temp dir (long-home
+    fallback) only this home's nodes (``hermes-lt-<hash>.*``) and only our own uid's are touched."""
     try:
-        for stale in (p for p in own_path.parent.glob("gateway.loop-tick.*.sock") if p != own_path):
+        if own_path.name.startswith(_TICK_SOCKET_FALLBACK_PREFIX):
+            pattern = f"{own_path.name.rsplit('.', 2)[0]}.*.sock"
+        else:
+            pattern = "gateway.loop-tick.*.sock"
+        uid = os.getuid()  # windows-footgun: ok — POSIX-only
+        for stale in (p for p in own_path.parent.glob(pattern) if p != own_path):
             try:
+                if stale.lstat().st_uid != uid:
+                    continue
                 os.kill(int(stale.name.split(".")[-2]), 0)  # windows-footgun: ok — POSIX-only
             except (ValueError, IndexError, OSError):
-                stale.unlink(missing_ok=True)
+                with contextlib.suppress(OSError):
+                    stale.unlink(missing_ok=True)
     except Exception:
         logger.debug("stale loop-tick socket sweep failed", exc_info=True)
 
@@ -365,8 +409,16 @@ async def loop_heartbeat_forever(
             tick_socket_path = get_loop_tick_socket_path(home)
             tick_socket_path.parent.mkdir(parents=True, exist_ok=True)
             _sweep_stale_tick_sockets(tick_socket_path)
-            tick_server = await asyncio.start_unix_server(_tick_socket_handler,
-                                                          path=str(tick_socket_path))
+            # Restrictive umask so the node is never connectable by others, even before the chmod:
+            # the long-home fallback lives in a shared temp dir.
+            old_umask = os.umask(0o177)
+            try:
+                tick_server = await asyncio.start_unix_server(_tick_socket_handler,
+                                                              path=str(tick_socket_path))
+            finally:
+                os.umask(old_umask)
+            with contextlib.suppress(OSError):
+                os.chmod(tick_socket_path, 0o600)
         else:
             tick_server = await asyncio.start_server(_tick_socket_handler, host="127.0.0.1", port=0)
             for _s in tick_server.sockets or []:
