@@ -176,6 +176,43 @@ def test_refresh_skip_when_not_expired():
     assert result["access_token"] == "old-access"
     assert result is state  # Same object returned (no refresh)
 
+def test_refresh_valid_token_without_refresh_token_skips_network():
+    """A still-valid access token needs no refresh_token: nothing is renewed, so nothing is required."""
+    state = {
+        "access_token": "long-lived-access",
+        "portal_base_url": MINIMAX_OAUTH_GLOBAL_BASE,
+        "client_id": MINIMAX_OAUTH_CLIENT_ID,
+        "inference_base_url": MINIMAX_OAUTH_GLOBAL_INFERENCE,
+        "expires_at": _future_iso(3600),
+    }
+
+    with patch("hermes_cli.auth_minimax.httpx.Client") as client_cls:
+        result = _refresh_minimax_oauth_state(state)
+
+    assert result is state
+    client_cls.assert_not_called()
+
+
+@pytest.mark.parametrize("expires_in, force", [(-60, False), (3600, True)])
+def test_refresh_without_refresh_token_still_requires_relogin_when_renewing(expires_in, force):
+    """Expired (or forced) renewal with no refresh_token cannot proceed: relogin, and no network call."""
+    state = {
+        "access_token": "access",
+        "portal_base_url": MINIMAX_OAUTH_GLOBAL_BASE,
+        "client_id": MINIMAX_OAUTH_CLIENT_ID,
+        "inference_base_url": MINIMAX_OAUTH_GLOBAL_INFERENCE,
+        "expires_at": _future_iso(expires_in),
+    }
+
+    with patch("hermes_cli.auth_minimax.httpx.Client") as client_cls:
+        with pytest.raises(AuthError) as exc_info:
+            _refresh_minimax_oauth_state(state, force=force)
+
+    assert exc_info.value.code == "no_refresh_token"
+    assert exc_info.value.relogin_required is True
+    client_cls.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # 9. test_refresh_updates_access_token
 # ---------------------------------------------------------------------------
