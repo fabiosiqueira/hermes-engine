@@ -910,6 +910,30 @@ def _by_message(c: _Ctx) -> Optional[Verdict]:
     return _classify_402(c.msg, dict) if usage_limit else _first_match(c.msg, _MESSAGE_TAIL_RULES)
 
 
+_MAX_WRAPPED_AUTH_DEPTH = 8
+
+
+def _wrapped_auth_failure(c: _Ctx) -> Optional[Verdict]:
+    """A credential failure the SDK re-raised as a transport error (``APIConnectionError('Connection error.')``).
+
+    A per-request token provider that raises is wrapped by the SDK, so the original ``AuthError`` (relogin
+    required) or ``CommandTokenError`` survives only on ``__cause__``. Neither resolves by retrying; surface the
+    provider's own message instead of the wrapper's."""
+    from agent.command_token_source import CommandTokenError
+    from hermes_cli.auth_constants import AuthError
+
+    seen = {id(c.error)}
+    current = getattr(c.error, "__cause__", None)
+    for _ in range(_MAX_WRAPPED_AUTH_DEPTH):
+        if current is None or id(current) in seen:
+            return None
+        seen.add(id(current))
+        if isinstance(current, CommandTokenError) or (isinstance(current, AuthError) and current.relogin_required):
+            return _v(_R.auth_permanent, message=str(current)[:500], **_ABORT_FALLBACK)
+        current = getattr(current, "__cause__", None)
+    return None
+
+
 def _by_transport(c: _Ctx) -> Optional[Verdict]:
     """SSL, disconnect, circuit-breaker and transport-type heuristics, in that order."""
     msg = c.msg
@@ -955,10 +979,10 @@ def _by_status(c: _Ctx) -> Optional[Verdict]:
 
 # Stage order: plugin hooks → the provider's own profile hook → provider-specific special cases →
 # HTTP status → MoA shapes → structured error code → message patterns → SSL → disconnect +
-# large session → transport types → unknown (retryable with backoff).
+# large session → wrapped credential failure → transport types → unknown (retryable with backoff).
 _STAGES: Sequence[Callable[[_Ctx], Optional[Verdict]]] = (
     _plugin_verdict, _profile_verdict, _provider_special_cases, _by_status, _moa_special_cases,
-    _by_error_code, _by_message, _by_transport,
+    _by_error_code, _by_message, _wrapped_auth_failure, _by_transport,
 )
 
 

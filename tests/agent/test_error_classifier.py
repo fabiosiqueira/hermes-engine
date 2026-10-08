@@ -2166,3 +2166,68 @@ class TestStreamingRenderFormatError:
         e = MockAPIError("Error rendering prompt with jinja template: ...", status_code=500)
         result = classify_api_error(e, provider="lm-studio", model="x")
         assert result.reason != FailoverReason.format_error
+
+
+class TestWrappedAuthFailureInCauseChain:
+    """A per-request token provider that raises is wrapped by the SDK as APIConnectionError('Connection error.').
+
+    Only a relogin / fixed command can resolve the underlying failure, so the retry loop must not treat it as
+    a transient transport error."""
+
+    @staticmethod
+    def _wrapped(cause: Exception | None) -> Exception:
+        import httpx
+        import openai
+
+        wrapper = openai.APIConnectionError(request=httpx.Request("POST", "https://example.invalid/v1/chat/completions"))
+        wrapper.__cause__ = cause
+        return wrapper
+
+    def test_auth_error_requiring_relogin_is_permanent_and_keeps_its_message(self):
+        from hermes_cli.auth_constants import AuthError
+
+        cause = AuthError("MiniMax OAuth state has no refresh_token; please re-login.",
+                          provider="minimax-oauth", code="no_refresh_token", relogin_required=True)
+        result = classify_api_error(self._wrapped(cause), provider="minimax-oauth", model="MiniMax-M2")
+        assert result.reason == FailoverReason.auth_permanent
+        assert result.retryable is False
+        assert result.should_fallback is True
+        assert result.message == "MiniMax OAuth state has no refresh_token; please re-login."
+
+    def test_command_token_error_is_permanent(self):
+        from agent.command_token_source import CommandTokenError
+
+        cause = CommandTokenError("key_cmd for provider 'acme' exited 1")
+        result = classify_api_error(self._wrapped(cause), provider="acme")
+        assert result.reason == FailoverReason.auth_permanent
+        assert result.retryable is False
+        assert result.should_fallback is True
+        assert result.message == "key_cmd for provider 'acme' exited 1"
+
+    def test_auth_error_found_deeper_in_the_chain(self):
+        from hermes_cli.auth_constants import AuthError
+
+        middle = RuntimeError("token provider failed")
+        middle.__cause__ = AuthError("please re-login", provider="x", relogin_required=True)
+        result = classify_api_error(self._wrapped(middle), provider="x")
+        assert result.reason == FailoverReason.auth_permanent
+        assert result.message == "please re-login"
+
+    def test_auth_error_without_relogin_requirement_stays_a_transport_error(self):
+        from hermes_cli.auth_constants import AuthError
+
+        cause = AuthError("portal temporarily unreachable", provider="x", relogin_required=False)
+        result = classify_api_error(self._wrapped(cause), provider="x")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+
+    def test_connection_error_without_cause_is_still_a_timeout(self):
+        result = classify_api_error(self._wrapped(None), provider="minimax-oauth")
+        assert result.reason == FailoverReason.timeout
+        assert result.retryable is True
+
+    def test_cyclic_cause_chain_terminates(self):
+        first, second = RuntimeError("a"), RuntimeError("b")
+        first.__cause__, second.__cause__ = second, first
+        result = classify_api_error(self._wrapped(first), provider="minimax-oauth")
+        assert result.reason == FailoverReason.timeout
