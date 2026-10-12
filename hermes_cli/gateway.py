@@ -353,9 +353,9 @@ _LOOP_TICK_ABSENT = object()
 def _probe_loop_tick_socket(pid: int, home: Path | None, timeout: float = 1.0) -> bool | None:
     """Ping the loop-tick witness socket: True answered, False node present but silent, None no node (not evidence)."""
     try:
-        from gateway.shutdown_watchdog import get_loop_tick_socket_path
+        from gateway.shutdown_watchdog import get_loop_tick_socket_path, is_trusted_tick_socket
         path = get_loop_tick_socket_path(home, pid)
-        if not path.is_socket():
+        if not is_trusted_tick_socket(path):
             return None
     except Exception:
         return None
