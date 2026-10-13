@@ -1301,7 +1301,6 @@ class TestSendDiscordForumMedia:
         session.post = MagicMock(return_value=thread_resp)
 
         post_calls = []
-        orig_post = session.post
 
         def track_post(url, **kwargs):
             post_calls.append({"url": url, "kwargs": kwargs})

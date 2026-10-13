@@ -527,14 +527,16 @@ venv and the checkout, never the home directory.
 
 ### Dependency security policy
 
-Hermes quarantines **its own** dependencies: the checkout's `[tool.uv] exclude-newer = "14 days"`
-keeps a freshly published release of any package Hermes itself depends on out of `hermes update`
-and the built-in lazy installs for two weeks, so a hijacked upload is caught upstream before it
-reaches users. **That quarantine does not apply to your plugin's dependencies.** When Hermes
-resolves your plugin into its environment, the cutoff stays on the packages Hermes itself locks
-and nowhere else, so a plugin can floor on a release published yesterday and install today — and the
-plugin's author, not Hermes, is responsible for what that pulls in. (A plugin that needs a newer
-version of a package Hermes itself depends on still waits out that package's window.)
+Hermes checks the age of **its own** dependencies when it locks them: the checkout's
+`[tool.uv] exclude-newer = "3 days"` keeps any release younger than three days out of `uv.lock`,
+so a hijacked upload has time to be caught upstream before it reaches users. Users install from
+that vetted lock; their machines never re-check dates. **The check does not apply to your
+plugin's dependencies.** When Hermes resolves your plugin into its environment, Hermes's exact
+pins stay put, other packages Hermes uses may move within the ranges Hermes declares, and
+everything else follows your requirements, so a plugin can floor on a release published
+yesterday and install today. The plugin's author, not Hermes, is responsible for what that pulls
+in. A plugin that requires a different version of a package Hermes pins exactly fails to install
+until Hermes's pin moves.
 
 Set your own policy and hold yourself to it. Strongly recommended:
 
@@ -543,8 +545,8 @@ Set your own policy and hold yourself to it. Strongly recommended:
 - **Floor on the oldest API-compatible version**, not the release of the week. A floor on a
   fresh wheel forces every installer onto it the day it appears; `>=old,!=broken,<next` keeps the
   wide range and skips the one bad release.
-- **Adopt a new-release quarantine of your own** — wait ~14 days before floors move to a new
-  release, and resolve with `uv --exclude-newer "14 days"` (or `UV_EXCLUDE_NEWER`) in your own CI so
+- **Adopt a release-age check of your own**: wait a few days before floors move to a new
+  release, and resolve with `uv --exclude-newer "3 days"` (or `UV_EXCLUDE_NEWER`) in your own CI so
   the lock you test is the one users get.
 - **Pin your lock, review your bumps.** Treat a dependency bump as a code change: read the
   upstream diff, then re-pin.
@@ -835,7 +837,8 @@ config_schema:
 **Secrets never touch `config.yaml`.** A `secret` field carries only the `.env`
 name and whether a value is set; the Desktop stores the value through the same
 credential route as provider API keys (`PUT /api/env`), and your plugin reads it
-with `os.environ.get("MY_PLUGIN_API_KEY")` — exactly like a `requires_env` entry.
+with `get_secret("MY_PLUGIN_API_KEY")` from `agent.secret_scope` — exactly like a `requires_env` entry.
+Never read `.env`, `auth.json` or another tool's credential files yourself (catalog rule 11).
 The `plugins.manage settings` action refuses secret keys and any value whose type
 or `choices` disagree with the schema.
 
@@ -1858,12 +1861,12 @@ class MyPlatformAdapter(BasePlatformAdapter):
     async def disconnect(self): ...
 
 def check_requirements():
-    import os
-    return bool(os.environ.get("MYPLATFORM_TOKEN"))
+    from agent.secret_scope import get_secret
+    return bool(get_secret("MYPLATFORM_TOKEN"))
 
 def _env_enablement():
-    import os
-    tok = os.getenv("MYPLATFORM_TOKEN", "").strip()
+    from agent.secret_scope import get_secret
+    tok = (get_secret("MYPLATFORM_TOKEN") or "").strip()
     if not tok:
         return None
     return {"token": tok}
@@ -1918,8 +1921,8 @@ class MyMemoryProvider(MemoryProvider):
         return "my-memory"
 
     def is_available(self) -> bool:
-        import os
-        return bool(os.environ.get("MY_MEMORY_API_KEY"))
+        from agent.secret_scope import get_secret
+        return bool(get_secret("MY_MEMORY_API_KEY"))
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
